@@ -309,6 +309,7 @@ __host__ __device__ constexpr int ncclProtoGrainSize(int proto) {
   return proto == NCCL_PROTO_LL ? 16 :
          proto == NCCL_PROTO_LL128 ? WARP_SIZE*NCCL_LL128_SHMEM_ELEMS_PER_THREAD/NCCL_LL128_LINEELEMS*NCCL_LL128_DATAELEMS*sizeof(uint64_t) :
          proto == NCCL_PROTO_SIMPLE ? 512 :
+         proto == NCCL_PROTO_TMA ? 512 :
          -1;
 }
 

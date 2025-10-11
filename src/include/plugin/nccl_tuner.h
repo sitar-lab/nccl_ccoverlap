@@ -36,7 +36,8 @@ typedef ncclNvlDomainInfo_v5_t ncclNvlDomainInfo_t;
 #define NCCL_PROTO_LL 0
 #define NCCL_PROTO_LL128 1
 #define NCCL_PROTO_SIMPLE 2
-#define NCCL_NUM_PROTOCOLS NCCL_NUM_PROTOCOLS_V5 // Simple/LL/LL128
+#define NCCL_PROTO_TMA 3
+#define NCCL_NUM_PROTOCOLS 4 // LL/LL128/Simple/TMA
 
 #define NCCL_ALGO_PROTO_IGNORE -1.0
 

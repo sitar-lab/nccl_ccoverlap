@@ -73,6 +73,7 @@ const char* ncclProtoToString(int proto) {
   case NCCL_PROTO_LL: return "LL";
   case NCCL_PROTO_LL128: return "LL128";
   case NCCL_PROTO_SIMPLE: return "SIMPLE";
+  case NCCL_PROTO_TMA: return "TMA";
   default: return "Unknown";
   }
 }
