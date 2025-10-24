@@ -284,4 +284,131 @@ __device__ __forceinline__ void reduceCopy(
      nDsts, [=]__device__(int i) { return dstPtrs[i]; }, nElts);
 }
 
+// SMEM-specific reduceCopy for TMA protocol
+// This version handles source pointers that are in shared memory
+template<int Unroll, typename RedFn, typename T,
+         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
+         typename IntBytes, typename SrcPtrFn, typename DstPtrFn>
+__device__ __forceinline__ void reduceCopyFromSmem(
+    int thread, int nThreads,
+    uint64_t redArg, uint64_t *preOpArgs, bool postOp,
+    int nSrcs, SrcPtrFn const &srcPtrFn, int nDsts, DstPtrFn const &dstPtrFn,
+    IntBytes nElts
+  ) {
+  static_assert(std::is_signed<IntBytes>::value, "IntBytes must be a signed integral type.");
+  
+  constexpr int BytePerPack = sizeof(T);
+  constexpr int BytePerHunk = Unroll*WARP_SIZE*BytePerPack;
+  
+  int nWarps = nThreads/WARP_SIZE;
+  int warp = thread/WARP_SIZE;
+  int lane = thread%WARP_SIZE;
+
+  IntBytes nBytesBehind = 0;
+  IntBytes nBytesAhead = nElts*sizeof(T);
+  
+  // Thread's initial position
+  IntBytes threadBytesBehind = nBytesBehind + (warp*BytePerHunk + lane*BytePerPack);
+  IntBytes threadBytesAhead = nBytesAhead - (warp*BytePerHunk + lane*BytePerPack);
+  IntBytes nHunksAhead = nBytesAhead/(BytePerHunk + !BytePerHunk);
+  
+  nBytesBehind += nHunksAhead*BytePerHunk;
+  nBytesAhead -= nHunksAhead*BytePerHunk;
+  if (Unroll==1 && BytePerPack <= nBytesAhead) {
+    nHunksAhead += 1;
+    nBytesBehind += nBytesAhead - (nBytesAhead%(BytePerPack + !BytePerPack));
+    nBytesAhead = nBytesAhead%(BytePerPack + !BytePerPack);
+  }
+  nHunksAhead -= warp;
+
+  RedFn redFn(redArg);
+  uintptr_t smemSrcs[MinDsts + !MinDsts]; // Use MinDsts as MaxSrcs for SMEM
+  uintptr_t minDsts[MinDsts + !MinDsts];
+  
+  #pragma unroll
+  for (int s=0; s < nSrcs && s < (MinDsts + !MinDsts); s++) {
+    // SMEM pointers don't need cvta_to_global, use direct address
+    smemSrcs[s] = reinterpret_cast<uintptr_t>(srcPtrFn(s)) + threadBytesBehind;
+  }
+
+  #pragma unroll
+  for (int d=0; d < MinDsts; d++) {
+    minDsts[d] = cvta_to_global(dstPtrFn(d)) + threadBytesBehind;
+  }
+
+  while (Unroll==1 ? (BytePerPack <= threadBytesAhead) : (0 < nHunksAhead)) {
+    BytePack<BytePerPack> acc[Unroll];
+
+    // Load from SMEM (first source)
+    { RedFn preFn(0 < PreOpSrcs ? preOpArgs[0] : 0);
+      #pragma unroll Unroll
+      for (int u=0; u < Unroll; u++) {
+        // Direct load from shared memory - no volatile needed
+        acc[u] = *reinterpret_cast<BytePack<BytePerPack>*>(smemSrcs[0]);
+        if (0 < PreOpSrcs) acc[u] = applyPreOp(preFn, acc[u]);
+        smemSrcs[0] += WARP_SIZE*BytePerPack;
+      }
+    }
+
+    // Handle additional SMEM sources if any
+    for (int s=1; s < nSrcs; s++) {
+      BytePack<BytePerPack> tmp[Unroll];
+      RedFn preFn(s < PreOpSrcs ? preOpArgs[s] : 0);
+      #pragma unroll Unroll
+      for (int u=0; u < Unroll; u++) {
+        tmp[u] = *reinterpret_cast<BytePack<BytePerPack>*>(smemSrcs[s]);
+        smemSrcs[s] += WARP_SIZE*BytePerPack;
+      }
+      #pragma unroll Unroll
+      for (int u=0; u < Unroll; u++) {
+        if (s < PreOpSrcs) tmp[u] = applyPreOp(preFn, tmp[u]);
+        acc[u] = applyReduce(redFn, acc[u], tmp[u]);
+      }
+    }
+
+    if (postOp) {
+      #pragma unroll Unroll
+      for (int u=0; u < Unroll; u++)
+        acc[u] = applyPostOp(redFn, acc[u]);
+    }
+
+    // Store to GMEM destinations
+    #pragma unroll (MinDsts + !MinDsts)
+    for (int d=0; d < MinDsts; d++) {
+      #pragma unroll Unroll
+      for (int u=0; u < Unroll; u++) {
+        if (d < MultimemDsts) {
+          multimem_st_global(minDsts[d], acc[u]);
+        } else {
+          st_global<BytePerPack>(minDsts[d], acc[u]);
+        }
+        minDsts[d] += WARP_SIZE*BytePerPack;
+      }
+    }
+    
+    for (int d=MinDsts; (MinDsts < MaxDsts) && (d < MaxDsts) && (d < nDsts); d++) {
+      uintptr_t dst = cvta_to_global(dstPtrFn(d)) + threadBytesBehind;
+      #pragma unroll Unroll
+      for (int u=0; u < Unroll; u++) {
+        st_global<BytePerPack>(dst, acc[u]);
+        dst += WARP_SIZE*BytePerPack;
+      }
+    }
+
+    nWarps = nThreads/WARP_SIZE;
+    #pragma unroll
+    for (int s=0; s < nSrcs && s < (MinDsts + !MinDsts); s++) {
+      smemSrcs[s] += (nWarps-1)*BytePerHunk;
+    }
+    #pragma unroll
+    for (int d=0; d < MinDsts; d++) {
+      minDsts[d] += (nWarps-1)*BytePerHunk;
+    }
+    threadBytesBehind += nWarps*BytePerHunk;
+    threadBytesAhead -= nWarps*BytePerHunk;
+    nHunksAhead -= nWarps;
+  }
+}
+
 #endif // COMMON_KERNEL_H_
+

@@ -270,6 +270,7 @@ struct ncclKernelPlan {
   uint64_t channelMask; // bitset of which channels are present
   bool hasProxyOps; // does any channel have a non-empty proxyOpQueue
   int threadPerBlock;
+  int proto;
 
   int collOpCount; // Number of collectives in this plan.
   int nWorkBatches; // Number of work batches.

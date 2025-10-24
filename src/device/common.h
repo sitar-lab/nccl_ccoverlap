@@ -12,6 +12,8 @@
 #include "op128.h"
 #include "reduce_kernel.h"
 #include "network/unpack/unpack_defs.h"
+#include <cuda/barrier>
+#include <type_traits>
 
 #define COLL_UNROLL (ncclCollUnroll())
 
@@ -58,6 +60,29 @@ struct ncclShmemData {
   uint64_t redOpArgs[NCCL_MAX_NVLS_ARITY+1];
 
   alignas(16) char workStorage[1024];
+
+
+  #ifndef NCCL_TMA_PIPE_DEPTH
+    #define NCCL_TMA_PIPE_DEPTH 2
+  #endif
+  #ifndef NCCL_TMA_SLOT_SIZE
+    #define NCCL_TMA_SLOT_SIZE (32 * 1024)  // 32KB per slot
+  #endif
+  void* tmaSlots[NCCL_TMA_PIPE_DEPTH];
+
+  // TMA Pipeline synchronization primitives (visible to all threads in block)
+  struct TmaPipeSync {
+    volatile int writeIdx;  // Next slot for loader to write
+    volatile int readIdx;   // Next slot for workers to read
+    volatile int usedSlots; // Number of slots currently in use (0 to PipeDepth)
+    volatile uint64_t sliceStep[NCCL_TMA_PIPE_DEPTH];  // Step number for each slot
+
+    // Storage for CUDA barriers (placement-new in TMA protocol)
+    using tma_barrier_t = cuda::barrier<cuda::thread_scope_block>;
+    using barrier_storage_t = std::aligned_storage_t<sizeof(tma_barrier_t), alignof(tma_barrier_t)>;
+    barrier_storage_t barrierStorage[NCCL_TMA_PIPE_DEPTH];
+    // Note: arrival_token is stored in thread-local registers, not shared memory
+  } tmaPipeSync;
 
   alignas(16) union {
     unpackShmem unpack;

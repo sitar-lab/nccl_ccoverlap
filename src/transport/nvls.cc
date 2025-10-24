@@ -448,13 +448,17 @@ ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent) {
         peer->send[1].conn.buffs[NCCL_PROTO_SIMPLE] = NULL;
         peer->send[1].conn.head = (uint64_t*)mem;
         peer->send[1].conn.tail = (uint64_t*)(mem + memSize / 2);
-        peer->send[1].conn.stepSize = nvlsStepSize;
+        for (int p=0; p<NCCL_NUM_PROTOCOLS; p++)
+          peer->send[1].conn.stepSizes[p] = 0;
+        peer->send[1].conn.stepSizes[NCCL_PROTO_SIMPLE] = nvlsStepSize;
         mem = resources->mcCredit + (h * 2 * nChannels + c) * memSize;
         peer->recv[0].transportComm = &nvlsTransport.recv;
         peer->recv[0].conn.buffs[NCCL_PROTO_SIMPLE] = NULL;
         peer->recv[0].conn.head = (uint64_t*)mem;
         peer->recv[0].conn.tail = (uint64_t*)(mem + memSize / 2);
-        peer->recv[0].conn.stepSize = nvlsStepSize;
+        for (int p=0; p<NCCL_NUM_PROTOCOLS; p++)
+          peer->recv[0].conn.stepSizes[p] = 0;
+        peer->recv[0].conn.stepSizes[NCCL_PROTO_SIMPLE] = nvlsStepSize;
         peer->recv[0].conn.flags |= NCCL_NVLS_MIN_POLL;
 
         // Broadcast MC -> UC
@@ -463,13 +467,17 @@ ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent) {
         peer->recv[1].conn.buffs[NCCL_PROTO_SIMPLE] = NULL;
         peer->recv[1].conn.head = (uint64_t*)mem;
         peer->recv[1].conn.tail = (uint64_t*)(mem + memSize / 2);
-        peer->recv[1].conn.stepSize = nvlsStepSize;
+        for (int p=0; p<NCCL_NUM_PROTOCOLS; p++)
+          peer->recv[1].conn.stepSizes[p] = 0;
+        peer->recv[1].conn.stepSizes[NCCL_PROTO_SIMPLE] = nvlsStepSize;
         mem = resources->mcCredit + ((h * 2 + 1) * nChannels + c) * memSize;
         peer->send[0].transportComm = &nvlsTransport.send;
         peer->send[0].conn.buffs[NCCL_PROTO_SIMPLE] = NULL;
         peer->send[0].conn.head = (uint64_t*)mem;
         peer->send[0].conn.tail = (uint64_t*)(mem + memSize / 2);
-        peer->send[0].conn.stepSize = nvlsStepSize;
+        for (int p=0; p<NCCL_NUM_PROTOCOLS; p++)
+          peer->send[0].conn.stepSizes[p] = 0;
+        peer->send[0].conn.stepSizes[NCCL_PROTO_SIMPLE] = nvlsStepSize;
         peer->send[0].conn.flags |= NCCL_NVLS_MIN_POLL;
 
         CUDACHECKGOTO(cudaMemcpyAsync(&comm->channels[c].devPeersHostPtr[nvlsPeer]->send[0], &peer->send[0].conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice, hostStream), res, fail);

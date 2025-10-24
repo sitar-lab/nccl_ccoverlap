@@ -6,7 +6,27 @@
 
 #include "network/unpack/unpack.h"
 #include <cassert>
+#include <cuda/barrier>
+#include <cuda/pipeline>
+#include <new>
 
+#ifndef NCCL_TMA_PIPE_DEPTH
+  #define NCCL_TMA_PIPE_DEPTH 2
+#endif
+
+// TMA Debug output
+#define NCCL_TMA_DEBUG 1
+
+#if NCCL_TMA_DEBUG
+  #define TMA_DEBUG_PRINT(fmt, ...) \
+    if (tid == 0 && blockIdx.x == 0) { \
+      printf("[TMA BLK=%d TID=%d] " fmt "\n", (int)blockIdx.x, (int)threadIdx.x, ##__VA_ARGS__); \
+    }
+#else
+  #define TMA_DEBUG_PRINT(fmt, ...) 
+#endif
+
+static constexpr int NCCL_TMA_MAX_SMEM_BYTES = 100 * 1024;  // 100KB
 enum primsTmaMode {
   primsTmaModeDefault = 0,
   primsTmaModePatRs = 1,
@@ -34,13 +54,15 @@ class Primitives<
                        PatMode = 0x800,
                        NvlsMinPolling = 0x1000,
                        NetDeviceUnpack = 0x2000,
-                       AnyNetDeviceUnpack = 0x4000;
+                       AnyNetDeviceUnpack = 0x4000,
+                       RoleTmaLoad = 0x8000;  // TMA prefetch role
   const int tid, tidInBlock;
   const int nthreads;
   int nworkers;
   const int stepSize;
   Fan fan;
   int index; // Peer index I'm responsible for
+  static constexpr int PipeDepth = NCCL_TMA_PIPE_DEPTH;
   int flags;
   int group;
   uint64_t step;
@@ -503,7 +525,7 @@ private:
       flags |= (conn->flags & NCCL_NVLS_MIN_POLL) ? NvlsMinPolling : 0;
       connStepPtr = conn->tail;
       connStepCache = loadStepValue(connStepPtr);
-      connStepSize = conn->stepSize/sizeof(T);
+      connStepSize = conn->stepSizes[NCCL_PROTO_TMA]/sizeof(T);
       connEltsFifo = (T*)conn->buffs[NCCL_PROTO_TMA];
       if (conn->connFifo != nullptr) {
         flags |= ConnFifoEnabled;
@@ -552,7 +574,7 @@ private:
       flags |= (conn->flags & NCCL_NVLS_MIN_POLL) ? NvlsMinPolling : 0;
       connStepPtr = conn->head;
       connStepCache = loadStepValue(connStepPtr);
-      connStepSize = conn->stepSize/sizeof(T);
+      connStepSize = conn->stepSizes[NCCL_PROTO_TMA]/sizeof(T);
       connEltsFifo = (T*)conn->buffs[NCCL_PROTO_TMA];
       if (Direct) {
         if (ipcRegFlag) {
@@ -679,7 +701,7 @@ private:
         peer->stepCache = loadStepValue(peer->tailPtr = conn->tail);
         peer->headPtr = conn->head;
         peer->accSize = 0;
-        peer->connStepSize = conn->stepSize/sizeof(T);
+        peer->connStepSize = conn->stepSizes[NCCL_PROTO_TMA]/sizeof(T);
         // Load send peer
         int sendPeer = mode == primsModePatAg ? (rank - delta + nranks) % nranks : (rank + delta) % nranks;
         peer = ((struct ncclPatPeer*)sendPeers)+tid;
@@ -690,7 +712,7 @@ private:
         peer->stepCache = loadStepValue(peer->headPtr = conn->head);
         peer->tailPtr = conn->tail;
         peer->accSize = 0;
-        peer->connStepSize = conn->stepSize/sizeof(T);
+        peer->connStepSize = conn->stepSizes[NCCL_PROTO_TMA]/sizeof(T);
       }
       if (tid==0) {
         ncclShmem.groups[group].userInput = (void*)inputBuf;

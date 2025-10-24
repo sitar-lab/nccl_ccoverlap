@@ -172,10 +172,10 @@ static ncclResult_t shmSendConnect(struct ncclComm* comm, struct ncclConnect* co
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
     send->conn.buffs[p] = buff;
     buff += comm->buffSizes[p];
+    send->conn.stepSizes[p] = comm->buffSizes[p]/NCCL_STEPS;
   }
   send->conn.tail = &resources->devRemHostMem->tail;
   send->conn.head = &resources->devHostMem->head;
-  send->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
 
   if (useMemcpyRecv) {
     send->conn.connFifo = resources->devRemHostMem->connFifo;
@@ -206,10 +206,10 @@ static ncclResult_t shmRecvConnect(struct ncclComm* comm, struct ncclConnect* co
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
     recv->conn.buffs[p] = buff;
     buff += comm->buffSizes[p];
+    recv->conn.stepSizes[p] = comm->buffSizes[p]/NCCL_STEPS;
   }
   recv->conn.head = &resources->devRemHostMem->head;
   recv->conn.tail = &resources->devHostMem->tail;
-  recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
 
   if (useMemcpyRecv) {
     struct shmProxyInfo proxyInfo = { NULL, NULL, recv->conn.buffs[NCCL_PROTO_SIMPLE], resources->remHostMem, resources->hostMem };

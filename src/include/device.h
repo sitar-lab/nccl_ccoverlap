@@ -134,7 +134,7 @@ struct ncclConnInfo {
 
   int flags;          // Direct communication / other flags
   int shared;         // Buffers are shared
-  int stepSize;       // Step size for the SIMPLE buffer
+  int stepSizes[NCCL_NUM_PROTOCOLS];
   void **ptrExchange; // Pointer exchange for direct communication
   uint64_t* redOpArgExchange; // PreOp scaler exchange for direct pull case
 
@@ -309,7 +309,7 @@ __host__ __device__ constexpr int ncclProtoGrainSize(int proto) {
   return proto == NCCL_PROTO_LL ? 16 :
          proto == NCCL_PROTO_LL128 ? WARP_SIZE*NCCL_LL128_SHMEM_ELEMS_PER_THREAD/NCCL_LL128_LINEELEMS*NCCL_LL128_DATAELEMS*sizeof(uint64_t) :
          proto == NCCL_PROTO_SIMPLE ? 512 :
-         proto == NCCL_PROTO_TMA ? 512 :
+         proto == NCCL_PROTO_TMA ? 16 :
          -1;
 }
 
@@ -525,6 +525,18 @@ __host__ __device__ constexpr int ncclShmemScratchWarpSize(int cudaArch = NCCL_C
 // The amount of dynamic shmem per block
 __host__ __device__ constexpr int ncclShmemDynamicSize(int cudaArch = NCCL_CUDA_ARCH) {
   return cudaArch < 700 ? 0 : ncclShmemScratchWarpSize(cudaArch)*(NCCL_MAX_NTHREADS/WARP_SIZE);
+}
+
+#ifndef NCCL_TMA_PIPE_DEPTH
+  #define NCCL_TMA_PIPE_DEPTH 2
+#endif
+#ifndef NCCL_TMA_SLOT_SIZE
+  #define NCCL_TMA_SLOT_SIZE (32 * 1024)  // 32KB per slot
+#endif
+
+__host__ __device__ constexpr int ncclShmemDynamicSizeTMA(int cudaArch = NCCL_CUDA_ARCH) {
+  // TMA needs: base dynamic SMEM + pipeline buffer
+  return ncclShmemDynamicSize(cudaArch) + (NCCL_TMA_PIPE_DEPTH * NCCL_TMA_SLOT_SIZE);
 }
 
 // Host-side table of kernel function pointers.

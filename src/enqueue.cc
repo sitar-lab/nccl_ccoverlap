@@ -30,7 +30,8 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
 
   if (maxStackSize) *maxStackSize = 0;
   int carveout = ncclParamL1SharedMemoryCarveout();
-  int ncclMaxSharedMem = ncclShmemDynamicSize(cudaArch);
+  // int ncclMaxSharedMem = ncclShmemDynamicSize(cudaArch);
+  int ncclMaxSharedMem = ncclShmemDynamicSizeTMA(cudaArch);
 
   for (int sym=0; sym <= 1; sym++) {
     int kcount = sym==0 ? ncclDevKernelCount : ncclSymkKernelCount;
@@ -713,6 +714,7 @@ static ncclResult_t scheduleCollTasksToPlan(
 
     plan->channelMask |= (2ull<<devWork->channelHi) - (1ull<<devWork->channelLo);
     plan->threadPerBlock = std::max(plan->threadPerBlock, task->nWarps*WARP_SIZE);
+    plan->proto = task->protocol;
     if (!plan->kernelSpecialized) {
       plan->kernelFn = ncclDevKernelForFunc[task->devFuncId];
       plan->kernelSpecialized = ncclDevKernelForFuncIsSpecialized[task->devFuncId];
@@ -1552,7 +1554,9 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   void* sym = plan->kernelFn;
   dim3 grid = {(unsigned)nChannels, 1, 1};
   dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};
-  int smem = ncclShmemDynamicSize(comm->cudaArch);
+  // int smem = ncclShmemDynamicSize(comm->cudaArch);
+  int smem = (plan->proto == NCCL_PROTO_TMA)? ncclShmemDynamicSizeTMA(comm->cudaArch) : ncclShmemDynamicSize(comm->cudaArch);
+
   cudaStream_t launchStream = planner->streams->stream;
 
   NCCLCHECK(ncclProfilerStartKernelLaunchEvent(plan, launchStream));
@@ -2004,8 +2008,8 @@ static ncclResult_t calcCollChunking(
   int nstepsPerLoop, nchunksPerLoop;
   size_t loopOffset = 0;
   int stepSize   = comm->buffSizes[info->protocol]/NCCL_STEPS;
-  int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
-  int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
+  int chunkSteps = ((info->protocol == NCCL_PROTO_SIMPLE || info->protocol == NCCL_PROTO_TMA) && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
+  int sliceSteps = ((info->protocol == NCCL_PROTO_SIMPLE || info->protocol == NCCL_PROTO_TMA) && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
   int chunkSize = stepSize*chunkSteps;
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;

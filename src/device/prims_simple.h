@@ -503,7 +503,7 @@ private:
       flags |= (conn->flags & NCCL_NVLS_MIN_POLL) ? NvlsMinPolling : 0;
       connStepPtr = conn->tail;
       connStepCache = loadStepValue(connStepPtr);
-      connStepSize = conn->stepSize/sizeof(T);
+      connStepSize = conn->stepSizes[NCCL_PROTO_SIMPLE]/sizeof(T);
       connEltsFifo = (T*)conn->buffs[NCCL_PROTO_SIMPLE];
       if (conn->connFifo != nullptr) {
         flags |= ConnFifoEnabled;
@@ -552,7 +552,7 @@ private:
       flags |= (conn->flags & NCCL_NVLS_MIN_POLL) ? NvlsMinPolling : 0;
       connStepPtr = conn->head;
       connStepCache = loadStepValue(connStepPtr);
-      connStepSize = conn->stepSize/sizeof(T);
+      connStepSize = conn->stepSizes[NCCL_PROTO_SIMPLE]/sizeof(T);
       connEltsFifo = (T*)conn->buffs[NCCL_PROTO_SIMPLE];
       if (Direct) {
         if (ipcRegFlag) {
@@ -679,7 +679,7 @@ private:
         peer->stepCache = loadStepValue(peer->tailPtr = conn->tail);
         peer->headPtr = conn->head;
         peer->accSize = 0;
-        peer->connStepSize = conn->stepSize/sizeof(T);
+        peer->connStepSize = conn->stepSizes[NCCL_PROTO_SIMPLE]/sizeof(T);
         // Load send peer
         int sendPeer = mode == primsModePatAg ? (rank - delta + nranks) % nranks : (rank + delta) % nranks;
         peer = ((struct ncclPatPeer*)sendPeers)+tid;
@@ -690,7 +690,7 @@ private:
         peer->stepCache = loadStepValue(peer->headPtr = conn->head);
         peer->tailPtr = conn->tail;
         peer->accSize = 0;
-        peer->connStepSize = conn->stepSize/sizeof(T);
+        peer->connStepSize = conn->stepSizes[NCCL_PROTO_SIMPLE]/sizeof(T);
       }
       if (tid==0) {
         ncclShmem.groups[group].userInput = (void*)inputBuf;
