@@ -43,6 +43,7 @@ namespace {
       for (size_t elemOffset = 0; elemOffset < partCount; elemOffset += chunkCount) {
         /////////////// begin AllGather steps ///////////////
         nelem = min(chunkCount, partCount - elemOffset);
+        // Calculate offset for this chunk
         dataOffset = partOffset + elemOffset;
 
         // step 0: push data to next GPU

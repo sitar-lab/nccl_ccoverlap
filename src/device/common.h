@@ -92,12 +92,22 @@ struct ncclShmemData {
 extern __shared__ ncclShmemData ncclShmem;
 #if __CUDA_ARCH__ >= 700
   extern __shared__ ulong2 ncclShmemPerWarp[/*ncclShmemDynamicSize()/sizeof(ulong2)*/];
+  extern __shared__ __align__(16) uint8_t ncclShmemTmaBuffer[/*ncclShmemTmaBufferSize()*/];
 #else
   extern __shared__ ulong2 ncclShmemPerWarp[ncclShmemScratchWarpSize()*(NCCL_MAX_NTHREADS/WARP_SIZE)/sizeof(ulong2)];
+  extern __shared__ __align__(16) uint8_t ncclShmemTmaBuffer[64*1024]; // 64KB for TMA loads
 #endif
 
 __device__ inline void* ncclScratchForWarp(int warp) {
   return (char*)ncclShmemPerWarp + warp*ncclShmemScratchWarpSize();
+}
+
+__device__ inline void* ncclTmaShmemBuffer() {
+  return (void*)ncclShmemTmaBuffer;
+}
+
+__device__ inline void* ncclTmaShmemSlot(int slotIdx, int slotSize) {
+  return (char*)ncclShmemTmaBuffer + slotIdx * slotSize;
 }
 
 __device__ inline void barrier_sync(int name) {
