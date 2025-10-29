@@ -4,10 +4,12 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#include "common.h"
 #include "network/unpack/unpack.h"
 #include <cassert>
 #include <cuda/barrier>
 #include <cuda/pipeline>
+#include <cuda/ptx>
 #include <new>
 
 #ifndef NCCL_TMA_PIPE_DEPTH
@@ -237,270 +239,313 @@ class Primitives<
     nelem = nelem < 0 ? 0 : nelem;
     int sliceSize = stepSize*StepPerSlice;
     sliceSize = max(divUp(nelem, 16*SlicePerChunk)*16, sliceSize/32);
-    int slice = 0;
-    // Sum of the number of elements processed
-    int offset = 0;
+    
+    const int totalSlices = (nelem + sliceSize - 1) / sliceSize;
+    
+    /* [ccoverlap] TMA Pipelined Implementation */
+    using tma_barrier_t = cuda::barrier<cuda::thread_scope_block>;
+    
+    // Barrier storage using aligned_storage to avoid dynamic initialization in __device__ function
+    __shared__ alignas(alignof(tma_barrier_t)) 
+      std::aligned_storage_t<sizeof(tma_barrier_t), alignof(tma_barrier_t)> 
+      barrierStorage[NCCL_TMA_PIPE_DEPTH];
+    
+    // Token은 thread-local register에 저장 (각 thread가 자신의 token 배열 보유)
+    typename tma_barrier_t::arrival_token tmaTokens[NCCL_TMA_PIPE_DEPTH];
+    
+    // Determine if TMA should be used
+    bool shouldUseTma = false;
+    if (Recv && !(flags & DirectWrite)) {
+      shouldUseTma = true;  // Recv: load received data to SMEM
+    } else if (Send && Src) {
+      shouldUseTma = true;  // Send: load source data to SMEM before sending
+    }
 
-    if (tid < nworkers && offset < nelem && !isNetOffload) {
-      #if __CUDA_ARCH__ < 700
-        // Above doesn't matter on older hardware.
-        #pragma unroll SlicePerChunk
-      #else
-        #pragma unroll 1
-      #endif
-      do {
-        sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
+    if (tid < nworkers && totalSlices > 0 && !isNetOffload && shouldUseTma) {
+      // ========================================
+      // TMA PIPELINED PATH
+      // ========================================
+      
+      // Initialize TMA barriers using placement new
+      if (tid == 0) {
+        #pragma unroll
+        for (int i = 0; i < NCCL_TMA_PIPE_DEPTH; ++i) {
+          new (&barrierStorage[i]) tma_barrier_t(nworkers);
+        }
+        #if __CUDA_ARCH__ >= 900
+        cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+        #endif
+        TMA_DEBUG_PRINT("TMA INIT: Initialized %d barriers, nworkers=%d", NCCL_TMA_PIPE_DEPTH, nworkers);
+      }
+      subBarrier(); // Wait for barrier initialization
+      
+      // ========================================
+      // PROLOGUE: Preload first NCCL_TMA_PIPE_DEPTH slices
+      // ========================================
+      int offset = 0;
+      int preloadCount = min(NCCL_TMA_PIPE_DEPTH, totalSlices);
+      
+      for (int preloadIdx = 0; preloadIdx < preloadCount; ++preloadIdx) {
+        int currentSliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
+        int tmaSlot = preloadIdx % NCCL_TMA_PIPE_DEPTH;
+        
+        // Update src/dst pointers
         if (tid == 0) {
           T* userInput = (T*)ncclShmem.groups[group].userInput;
           T* userOutput = (T*)ncclShmem.groups[group].userOutput;
           if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
           if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
         }
-        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
         
-        // [TMA] Load data from srcs to shared memory using TMA
-        bool usedTmaLoad = false;
+        // Wait for peer to produce data
+        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, currentSliceSize);
         
-        TMA_DEBUG_PRINT("TMA CHECK: Recv=%d, DirectRecv=%d, Send=%d, DirectSend=%d, Src=%d, Dst=%d, slice=%d, flags=0x%x", 
-                        Recv, DirectRecv, Send, DirectSend, Src, Dst, slice, flags);
-        
-        // TMA can be used for both receive and send operations
-        // For Recv: Skip TMA if using DirectWrite (peer writes directly to our buffer)
-        // For Send: Use TMA to stage data in shared memory before sending
-        bool shouldUseTma = false;
-        if (Recv && !(flags & DirectWrite)) {
-          shouldUseTma = true;  // Recv: load received data to SMEM
-          TMA_DEBUG_PRINT("TMA: Will load for RECV");
-        } else if (Send && Src) {
-          shouldUseTma = true;  // Send: load source data to SMEM before sending
-          TMA_DEBUG_PRINT("TMA: Will load for SEND (Src data)");
-        }
-        
-        if (shouldUseTma) {
-          using tma_barrier_t = cuda::barrier<cuda::thread_scope_block>;
-          
-          // Get TMA slot for current slice (ping-pong between slots)
-          int tmaSlot = slice % NCCL_TMA_PIPE_DEPTH;
+        // Issue TMA load (thread 0 only)
+        if (tid == 0) {
           void* tmaShmemSlot = ncclTmaShmemSlot(tmaSlot, NCCL_TMA_SLOT_SIZE);
+          tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[tmaSlot]);
           
-          TMA_DEBUG_PRINT("TMA LOAD: slice=%d, tmaSlot=%d, offset=%d, sliceSize=%d, nrecv=%d, nsend=%d", 
-                          slice, tmaSlot, offset, sliceSize, fan.nrecv(), fan.nsend());
-          
-          // Initialize barrier for this slot (only once per slot reuse)
-          if (tid == 0 && offset == 0) {
-            // Initialize all barriers at the beginning
-            #pragma unroll
-            for (int i = 0; i < NCCL_TMA_PIPE_DEPTH; ++i) {
-              new (&ncclShmem.tmaPipeSync.barrierStorage[i]) tma_barrier_t(nworkers);
-            }
-            // Ensure barrier initialization is visible
-            #if __CUDA_ARCH__ >= 900
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            #endif
-            TMA_DEBUG_PRINT("TMA INIT: Initialized %d barriers, nworkers=%d", NCCL_TMA_PIPE_DEPTH, nworkers);
-          }
-          subBarrier(); // Wait for barrier initialization
-          
-          // Get barrier for this slot
-          auto* barrier = reinterpret_cast<tma_barrier_t*>(&ncclShmem.tmaPipeSync.barrierStorage[tmaSlot]);
-          
-          // Issue TMA load (only thread 0)
-          if (tid == 0) {
-            // For Recv, load from recv peers
-            if (Recv) {
-              for (int i = 0; i < fan.nrecv(); i++) {
-                if (ncclShmem.groups[group].srcs[i] != nullptr) {
-                  void* globalSrc = ncclShmem.groups[group].srcs[i];
-                  void* shmemDst = (char*)tmaShmemSlot + i * sliceSize * sizeof(T);
-                  size_t loadBytes = sliceSize * sizeof(T);
-                  
-                  TMA_DEBUG_PRINT("TMA ASYNC (RECV): peer=%d, globalSrc=%p, shmemDst=%p, loadBytes=%lu", 
-                                  i, globalSrc, shmemDst, (unsigned long)loadBytes);
-                  
-                  // TMA bulk copy from global to shared memory
-                  #if __CUDA_ARCH__ >= 900
-                  cuda::memcpy_async(
-                    shmemDst,
-                    reinterpret_cast<const unsigned char*>(globalSrc),
-                    cuda::aligned_size_t<16>(loadBytes),
-                    *barrier);
-                  #else
-                  TMA_DEBUG_PRINT("TMA SKIP: CUDA_ARCH < 900, TMA not available");
-                  #endif
-                }
-              }
-            }
-            // For Send with Src, load from src[0] (user input or output buffer)
-            else if (Send && Src) {
-              if (ncclShmem.groups[group].srcs[0] != nullptr) {
-                void* globalSrc = ncclShmem.groups[group].srcs[0];
-                void* shmemDst = (char*)tmaShmemSlot;
-                size_t loadBytes = sliceSize * sizeof(T);
+          if (Recv) {
+            for (int i = 0; i < fan.nrecv(); i++) {
+              if (ncclShmem.groups[group].srcs[i] != nullptr) {
+                void* globalSrc = ncclShmem.groups[group].srcs[i];
+                void* shmemDst = (char*)tmaShmemSlot + i * currentSliceSize * sizeof(T);
+                size_t loadBytes = currentSliceSize * sizeof(T);
                 
-                TMA_DEBUG_PRINT("TMA ASYNC (SEND): globalSrc=%p, shmemDst=%p, loadBytes=%lu", 
-                                globalSrc, shmemDst, (unsigned long)loadBytes);
+                TMA_DEBUG_PRINT("TMA PRELOAD[%d]: slot=%d, globalSrc=%p, shmemDst=%p, loadBytes=%lu", 
+                                preloadIdx, tmaSlot, globalSrc, shmemDst, (unsigned long)loadBytes);
                 
-                // TMA bulk copy from global to shared memory
                 #if __CUDA_ARCH__ >= 900
                 cuda::memcpy_async(
                   shmemDst,
                   reinterpret_cast<const unsigned char*>(globalSrc),
                   cuda::aligned_size_t<16>(loadBytes),
-                  *barrier);
-                #else
-                TMA_DEBUG_PRINT("TMA SKIP: CUDA_ARCH < 900, TMA not available");
+                  *tmaBar);
+                #endif
+              }
+            }
+          } else if (Send && Src) {
+            if (ncclShmem.groups[group].srcs[0] != nullptr) {
+              void* globalSrc = ncclShmem.groups[group].srcs[0];
+              void* shmemDst = (char*)tmaShmemSlot;
+              size_t loadBytes = currentSliceSize * sizeof(T);
+              
+              TMA_DEBUG_PRINT("TMA PRELOAD[%d]: slot=%d, globalSrc=%p, loadBytes=%lu", 
+                              preloadIdx, tmaSlot, globalSrc, (unsigned long)loadBytes);
+              
+              #if __CUDA_ARCH__ >= 900
+              cuda::memcpy_async(
+                shmemDst,
+                reinterpret_cast<const unsigned char*>(globalSrc),
+                cuda::aligned_size_t<16>(loadBytes),
+                *tmaBar);
+              #endif
+            }
+          }
+        }
+        
+        // All threads arrive at barrier and save token
+        tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[tmaSlot]);
+        tmaTokens[tmaSlot] = tmaBar->arrive();
+        
+        offset += currentSliceSize;
+      }
+      
+      // ========================================
+      // MAIN LOOP: Consume 1, Produce 1
+      // ========================================
+      offset = 0; // Reset offset for main loop
+      for (int slice = 0; slice < totalSlices; ++slice) {
+        int currentSliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
+        int tmaSlot = slice % NCCL_TMA_PIPE_DEPTH;
+        
+        // Wait for TMA load completion of current slice
+        tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[tmaSlot]);
+        tmaBar->wait(std::move(tmaTokens[tmaSlot]));
+        
+        TMA_DEBUG_PRINT("TMA WAIT DONE: slice=%d, tmaSlot=%d", slice, tmaSlot);
+        
+        // Update src pointers to point to SMEM
+        if (tid == 0) {
+          void* tmaShmemSlot = ncclTmaShmemSlot(tmaSlot, NCCL_TMA_SLOT_SIZE);
+          if (Recv) {
+            for (int i = 0; i < fan.nrecv(); i++) {
+              if (ncclShmem.groups[group].srcs[i] != nullptr) {
+                void* oldSrc = ncclShmem.groups[group].srcs[i];
+                ncclShmem.groups[group].srcs[i] = (T*)((char*)tmaShmemSlot + i * currentSliceSize * sizeof(T));
+                TMA_DEBUG_PRINT("TMA UPDATE SRC[%d]: %p -> %p (SMEM)", i, oldSrc, ncclShmem.groups[group].srcs[i]);
+              }
+            }
+          } else if (Send && Src) {
+            void* oldSrc = ncclShmem.groups[group].srcs[0];
+            ncclShmem.groups[group].srcs[0] = (T*)tmaShmemSlot;
+            TMA_DEBUG_PRINT("TMA UPDATE SRC[0]: %p -> %p (SMEM)", oldSrc, ncclShmem.groups[group].srcs[0]);
+          }
+        }
+        
+        subBarrier();
+        
+        // ========================================
+        // PROCESS: ReduceCopy current slice (uses data from SMEM)
+        // ========================================
+        int workSize = ncclShmem.aborted ? 0 : currentSliceSize;
+        bool usedTmaLoad = true;  // Always true in TMA path
+        
+        if (flags & AnyNetDeviceUnpack) {
+          ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
+          subBarrier();
+        }
+
+        // Perform reduceCopy from SMEM
+        if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
+          constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
+                                    DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
+          
+          TMA_DEBUG_PRINT("REDUCE_COPY (TMA): slice=%d, workSize=%d", slice, workSize);
+          
+          reduceCopyFromSmem<Unroll, RedOp, T,
+            MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+            (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
+              Recv * fan.nrecv() + Src, [&](int i) { return ncclShmem.groups[group].srcs[i]; },
+              Send * fan.nsend() + Dst, [&](int i) { return ncclShmem.groups[group].dsts[i]; },
+              workSize);
+        } else {
+          workSize = 0;
+        }
+        TMA_DEBUG_PRINT("BEFORE POST PEER (TMA): slice=%d", slice);
+        barrier(); // Sync before issuing next TMA
+        postPeer<Recv, Send>(0 < workSize);
+        TMA_DEBUG_PRINT("AFTER POST PEER (TMA): slice=%d", slice);
+        // ========================================
+        // PRODUCE: Issue TMA load for next slice (slice + NCCL_TMA_PIPE_DEPTH)
+        // ========================================
+        int nextSlice = slice + NCCL_TMA_PIPE_DEPTH;
+        if (nextSlice < totalSlices) {
+          int nextOffset = offset + NCCL_TMA_PIPE_DEPTH * sliceSize;
+          int nextSliceSize = sliceSize < nelem-nextOffset ? sliceSize : nelem-nextOffset;
+          int nextTmaSlot = nextSlice % NCCL_TMA_PIPE_DEPTH;
+          
+          // Update pointers for next slice
+          if (tid == 0) {
+            T* userInput = (T*)ncclShmem.groups[group].userInput;
+            T* userOutput = (T*)ncclShmem.groups[group].userOutput;
+            if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + nextOffset;
+            if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + nextOffset;
+          }
+          
+          // Wait for peer to produce next data
+          waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, nextOffset, nextSliceSize);
+          
+          // Issue TMA for next slice
+          if (tid == 0) {
+            void* tmaShmemSlot = ncclTmaShmemSlot(nextTmaSlot, NCCL_TMA_SLOT_SIZE);
+            tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[nextTmaSlot]);
+            
+            if (Recv) {
+              for (int i = 0; i < fan.nrecv(); i++) {
+                if (ncclShmem.groups[group].srcs[i] != nullptr) {
+                  void* globalSrc = ncclShmem.groups[group].srcs[i];
+                  void* shmemDst = (char*)tmaShmemSlot + i * nextSliceSize * sizeof(T);
+                  size_t loadBytes = nextSliceSize * sizeof(T);
+                  
+                  TMA_DEBUG_PRINT("TMA PRODUCE[%d]: slot=%d, globalSrc=%p, loadBytes=%lu", 
+                                  nextSlice, nextTmaSlot, globalSrc, (unsigned long)loadBytes);
+                  
+                  #if __CUDA_ARCH__ >= 900
+                  cuda::memcpy_async(
+                    shmemDst,
+                    reinterpret_cast<const unsigned char*>(globalSrc),
+                    cuda::aligned_size_t<16>(loadBytes),
+                    *tmaBar);
+                  #endif
+                }
+              }
+            } else if (Send && Src) {
+              if (ncclShmem.groups[group].srcs[0] != nullptr) {
+                void* globalSrc = ncclShmem.groups[group].srcs[0];
+                void* shmemDst = (char*)tmaShmemSlot;
+                size_t loadBytes = nextSliceSize * sizeof(T);
+                
+                TMA_DEBUG_PRINT("TMA PRODUCE[%d]: slot=%d, loadBytes=%lu", 
+                                nextSlice, nextTmaSlot, (unsigned long)loadBytes);
+                
+                #if __CUDA_ARCH__ >= 900
+                cuda::memcpy_async(
+                  shmemDst,
+                  reinterpret_cast<const unsigned char*>(globalSrc),
+                  cuda::aligned_size_t<16>(loadBytes),
+                  *tmaBar);
                 #endif
               }
             }
           }
           
-          // All threads arrive at barrier and wait for TMA completion
-          auto token = barrier->arrive();
-          barrier->wait(std::move(token));
-          
-          TMA_DEBUG_PRINT("TMA WAIT DONE: slice=%d completed", slice);
-          
-          // Update srcs to point to shared memory (thread 0)
-          if (tid == 0) {
-            if (Recv) {
-              for (int i = 0; i < fan.nrecv(); i++) {
-                if (ncclShmem.groups[group].srcs[i] != nullptr) {
-                  void* oldSrc = ncclShmem.groups[group].srcs[i];
-                  ncclShmem.groups[group].srcs[i] = (T*)((char*)tmaShmemSlot + i * sliceSize * sizeof(T));
-                  TMA_DEBUG_PRINT("TMA UPDATE SRC[%d]: %p -> %p (SMEM)", i, oldSrc, ncclShmem.groups[group].srcs[i]);
-                }
-              }
-            } else if (Send && Src) {
-              void* oldSrc = ncclShmem.groups[group].srcs[0];
-              ncclShmem.groups[group].srcs[0] = (T*)tmaShmemSlot;
-              TMA_DEBUG_PRINT("TMA UPDATE SRC[0]: %p -> %p (SMEM)", oldSrc, ncclShmem.groups[group].srcs[0]);
-            }
-          }
-          usedTmaLoad = true;
+          // Save token for next slice
+          tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[nextTmaSlot]);
+          tmaTokens[nextTmaSlot] = tmaBar->arrive();
         }
         
-        subBarrier();
-        /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
-         * to 0 to avoid unnecessary workload. */
-        int workSize = ncclShmem.aborted ? 0 : sliceSize;
-        if (flags & AnyNetDeviceUnpack) {
-          ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
-          // Sync here to make sure all workers are reading from the updated srcs)
-          subBarrier();
+        offset += currentSliceSize;
+      }
+      
+      // TMA path done
+    } else if (tid < nworkers && nelem > 0 && !isNetOffload) {
+      // ========================================
+      // NON-TMA PATH (Fallback)
+      // ========================================
+      int slice = 0;
+      int offset = 0;
+      
+      #if __CUDA_ARCH__ < 700
+        #pragma unroll SlicePerChunk
+      #else
+        #pragma unroll 1
+      #endif
+      do {
+        int currentSliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
+        if (tid == 0) {
+          T* userInput = (T*)ncclShmem.groups[group].userInput;
+          T* userOutput = (T*)ncclShmem.groups[group].userOutput;
+          if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
+          if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
         }
-
-        if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
-            /* NVLS can have srcs[0] == dsts[0], but we cannot enter this "if branch",
-             * so we need to check whether MultimemSrcs and MultimemDsts are 0. */
-            && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
-          // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
-          if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
-            // TMA loaded data is already in the right place, just copy to send dests
-            if (usedTmaLoad) {
-              reduceCopyFromSmem<Unroll, RedOp, T, 0, 1, MaxSend, /*PreOpSrcs*/0>
-                (tid, nworkers, /*redArg*/0, /*preOpArgs*/nullptr, /*postOp*/false,
-                 1, [&](int i) { return ncclShmem.groups[group].srcs[i]; },
-                 fan.nsend(), [&](int i) { return ncclShmem.groups[group].dsts[1+i]; },
-                 workSize);
-            } else {
-              reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
-                (tid, nworkers, /*redArg*/0, /*preOpArgs*/nullptr, /*postOp*/false,
-                 1, ncclShmem.groups[group].srcs,
-                 fan.nsend(), ncclShmem.groups[group].dsts+1,
-                 workSize);
-            }
-          }
-        } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
-          // For broadcast in CollNet to do empty send
-          if (usedTmaLoad) {
-            reduceCopyFromSmem<Unroll, RedOp, T, 0, 1, 1, /*PreOpSrcs*/0>
-              (tid, nworkers, ncclShmem.redOpArgs[0],  nullptr, postOp,
-               Recv, [&](int i) { return ncclShmem.groups[group].srcs[i]; },
-               Dst, [&](int i) { return ncclShmem.groups[group].dsts[i]; },
-               workSize);
-          } else {
-            reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
-              (tid, nworkers, ncclShmem.redOpArgs[0],  nullptr, postOp,
-               Recv, ncclShmem.groups[group].srcs,
-               Dst, ncclShmem.groups[group].dsts,
-               workSize);
-          }
-        } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
+        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, currentSliceSize);
+        
+        subBarrier();
+        int workSize = ncclShmem.aborted ? 0 : currentSliceSize;
+        
+        if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
           constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
                                     DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
           
-          TMA_DEBUG_PRINT("REDUCE_COPY: usedTmaLoad=%d, workSize=%d, nSrcs=%d, nDsts=%d", 
-                          usedTmaLoad, workSize, Recv * fan.nrecv() + Src, Send * fan.nsend() + Dst);
-          
-          if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
-            // this case should only be directCopySend() with registered buffers and send to net peer
-            if (usedTmaLoad) {
-              TMA_DEBUG_PRINT("Using reduceCopyFromSmem (case 1)");
-              reduceCopyFromSmem<Unroll, RedOp, T, 0, 1, 1, PreOpSrcs>
-                (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
-                  Recv * fan.nrecv() + Src, [&](int i) { return ncclShmem.groups[group].srcs[i]; },
-                  1, [&](int i) { return ncclShmem.groups[group].dsts[i]; },
-                  workSize);
-            } else {
-              TMA_DEBUG_PRINT("Using reduceCopy (case 1)");
-              reduceCopy<Unroll, RedOp, T,
-                0, Recv + Src, Recv * MaxRecv + Src,
-                0, 1, 1, PreOpSrcs>
-                (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
-                  Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                  1, ncclShmem.groups[group].dsts,
-                  workSize);
-            }
-          } else {
-            if (usedTmaLoad) {
-              TMA_DEBUG_PRINT("Using reduceCopyFromSmem (case 2)");
-              reduceCopyFromSmem<Unroll, RedOp, T,
-                MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
-                (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
-                  Recv * fan.nrecv() + Src, [&](int i) { return ncclShmem.groups[group].srcs[i]; },
-                  Send * fan.nsend() + Dst, [&](int i) { return ncclShmem.groups[group].dsts[i]; },
-                  workSize);
-            } else {
-              TMA_DEBUG_PRINT("Using reduceCopy (case 2)");
-              reduceCopy<Unroll, RedOp, T,
-                MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
-                MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
-                (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
-                  Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                  Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
-                  workSize);
-            }
-          }
+          reduceCopy<Unroll, RedOp, T,
+            MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+            MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+            (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
+              Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+              Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
+              workSize);
         } else {
-          // we will come here when calling prims.directSend with net peer,
-          // in this case, ncclShmem.groups[group].dsts[0] == NULL, so we
-          // skip data flush.
           workSize = 0;
         }
-        barrier(); // This barrier has a counterpart in following loop
+        barrier();
         postPeer<Recv, Send>(0 < workSize);
-        offset += sliceSize;
+        offset += currentSliceSize;
         slice += 1;
-        // Yes, for some template arguments this code will be unreachable.  That's fine.
-        // coverity[dead_error_line]
       } while (slice < SlicePerChunk && offset < nelem);
     }
 
-    // Non-workers come straight here. Workers too but only once the remaining
-    // slices are all empty. Since empty slices are the uncommon case, and
-    // worker perf is the limiter, perf-wise this loop is effectively unentered,
-    // hence just a single branch insn.
+    // Non-workers or empty slices
+    // int slice = shouldUseTma ? totalSlices : 0;
+    int slice = tid < nworkers ? totalSlices : 0;
     #pragma unroll 1
     while (slice < SlicePerChunk) {
-      sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
-      { // Only workers could have Wait roles so we know the slice must be empty
-        // since we've exited the loop above.
-        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(0, 0, 0, sliceSize);
-      }
-      barrier(); // Has couterpart in preceding worker-only loop.
-      int workSize = ncclShmem.aborted ? 0 : sliceSize;
+      int offset = slice * sliceSize;
+      int currentSliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
+      { waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(0, 0, 0, currentSliceSize); }
+      barrier();
+      int workSize = ncclShmem.aborted ? 0 : currentSliceSize;
       postPeer<Recv, Send>(0 < workSize);
-      offset += sliceSize;
       slice += 1;
     }
   }

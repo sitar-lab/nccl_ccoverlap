@@ -76,12 +76,8 @@ struct ncclShmemData {
     volatile int readIdx;   // Next slot for workers to read
     volatile int usedSlots; // Number of slots currently in use (0 to PipeDepth)
     volatile uint64_t sliceStep[NCCL_TMA_PIPE_DEPTH];  // Step number for each slot
-
-    // Storage for CUDA barriers (placement-new in TMA protocol)
-    using tma_barrier_t = cuda::barrier<cuda::thread_scope_block>;
-    using barrier_storage_t = std::aligned_storage_t<sizeof(tma_barrier_t), alignof(tma_barrier_t)>;
-    barrier_storage_t barrierStorage[NCCL_TMA_PIPE_DEPTH];
     // Note: arrival_token is stored in thread-local registers, not shared memory
+    // Note: barriers are in separate kernel-scope shared memory (ncclShmemTmaBarriers)
   } tmaPipeSync;
 
   alignas(16) union {
