@@ -17,7 +17,7 @@
 #endif
 
 // TMA Debug output
-#define NCCL_TMA_DEBUG 1
+#define NCCL_TMA_DEBUG 0
 
 #if NCCL_TMA_DEBUG
   #define TMA_DEBUG_PRINT(fmt, ...) \
@@ -132,6 +132,47 @@ class Primitives<
   /*
     offset : offset += sliceSize in each slice iteration
   */
+  
+  // Separate function for TMA prologue/produce: wait for specific slice's data
+  template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
+  __device__ __forceinline__ void waitPeerForTmaLoad(intptr_t srcIx, intptr_t dstIx, int offset, int nelts, int sliceStep) {
+    const int index = Src ? 0 : (Dst ? (Send && Recv ? MaxSend : 0) : 0);
+
+    // For Recv: Wait until peer has produced data for the specified slice step
+    if (flags & (Recv * RoleWaitRecv)) {
+      int spins = 0;
+      while (connStepCache < sliceStep + StepPerSlice) {
+        connStepCache = loadStepValue(connStepPtr);
+        if (checkAbort(flags, Aborted, spins)) break;
+      }
+
+      // Set up source pointers to peer's FIFO buffer at the specified step
+      void **ptrs = ncclShmem.groups[group].srcs + Src;
+      
+      if ((flags & ConnFifoEnabled) && connFifo[sliceStep%NCCL_STEPS].mode == NCCL_MODE_OFFSET) {
+        ptrs[index] = connEltsFifo + loadInt(&connFifo[sliceStep%NCCL_STEPS].offset)/sizeof(T);
+      } else if (DirectRecv && !Direct) {
+        if (flags & DirectRead) {
+          ptrs[index] = directBuff + srcIx + offset;
+        } else {
+          ptrs[index] = connEltsFifo + (sliceStep%NCCL_STEPS)*connStepSize;
+        }
+      } else {
+        ptrs[index] = connEltsFifo + (sliceStep%NCCL_STEPS)*connStepSize;
+      }
+    }
+    
+    // For Send: Wait until peer's FIFO has space (for when we send to peer)
+    if (flags & (Send * RoleWaitSend)) {
+      int spins = 0;
+      while (connStepCache + NCCL_STEPS < sliceStep + StepPerSlice) {
+        connStepCache = loadStepValue(connStepPtr);
+        if (checkAbort(flags, Aborted, spins)) break;
+      }
+      // Note: Src pointers for Send should be set by caller (to user buffer)
+    }
+  }
+  
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
   __device__ __forceinline__ void waitPeer(intptr_t srcIx, intptr_t dstIx, int offset, int nelts) {
     
@@ -240,8 +281,12 @@ class Primitives<
     int sliceSize = stepSize*StepPerSlice;
     sliceSize = max(divUp(nelem, 16*SlicePerChunk)*16, sliceSize/32);
     
+
     const int totalSlices = (nelem + sliceSize - 1) / sliceSize;
     
+    TMA_DEBUG_PRINT("GENERICOP INIT: Src=%d, Dst=%d, SrcBuf=%d, DstBuf=%d", Src, Dst, SrcBuf, DstBuf);
+    TMA_DEBUG_PRINT("GENERICOP INIT: nelem = %d, Slice Size=%d, SlicePerChunk=%d",nelem, sliceSize, SlicePerChunk);
+
     /* [ccoverlap] TMA Pipelined Implementation */
     using tma_barrier_t = cuda::barrier<cuda::thread_scope_block>;
     
@@ -284,21 +329,30 @@ class Primitives<
       // ========================================
       int offset = 0;
       int preloadCount = min(NCCL_TMA_PIPE_DEPTH, totalSlices);
+
+      TMA_DEBUG_PRINT("TMA PROLOGUE: Initialized preloadCount=%d, totalSlices=%d", preloadCount, totalSlices);
+      
       
       for (int preloadIdx = 0; preloadIdx < preloadCount; ++preloadIdx) {
         int currentSliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
         int tmaSlot = preloadIdx % NCCL_TMA_PIPE_DEPTH;
         
-        // Update src/dst pointers
-        if (tid == 0) {
+        // For Send operations, set source pointer to user buffer first
+        if (tid == 0 && Send && Src) {
           T* userInput = (T*)ncclShmem.groups[group].userInput;
           T* userOutput = (T*)ncclShmem.groups[group].userOutput;
-          if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
-          if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
+          ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
         }
         
-        // Wait for peer to produce data
-        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, currentSliceSize);
+        // [TMA PROLOGUE] Wait for peer + setup pointers for slice index preloadIdx
+        // Pass preloadIdx as the sliceStep so each slice waits for its own step
+        waitPeerForTmaLoad<DirectRecv, DirectSend, Recv, Send, Src, Dst>(
+          srcIx, dstIx, offset, currentSliceSize, /*sliceStep=*/preloadIdx);
+        
+        if (tid == 0) {
+          TMA_DEBUG_PRINT("TMA PROLOGUE: preloadIdx=%d step=%ld srcPtr=%p connStepCache=%ld", 
+                          preloadIdx, step, ncclShmem.groups[group].srcs[0], connStepCache);
+        }
         
         // Issue TMA load (thread 0 only)
         if (tid == 0) {
@@ -316,11 +370,15 @@ class Primitives<
                                 preloadIdx, tmaSlot, globalSrc, shmemDst, (unsigned long)loadBytes);
                 
                 #if __CUDA_ARCH__ >= 900
+                TMA_DEBUG_PRINT("TMA PRELOAD[%d]: Calling cuda::memcpy_async (ARCH=%d)", preloadIdx, __CUDA_ARCH__);
                 cuda::memcpy_async(
                   shmemDst,
                   reinterpret_cast<const unsigned char*>(globalSrc),
                   cuda::aligned_size_t<16>(loadBytes),
                   *tmaBar);
+                TMA_DEBUG_PRINT("TMA PRELOAD[%d]: cuda::memcpy_async returned", preloadIdx);
+                #else
+                TMA_DEBUG_PRINT("TMA PRELOAD[%d]: SKIPPED - ARCH=%d < 900", preloadIdx, __CUDA_ARCH__);
                 #endif
               }
             }
@@ -334,11 +392,15 @@ class Primitives<
                               preloadIdx, tmaSlot, globalSrc, (unsigned long)loadBytes);
               
               #if __CUDA_ARCH__ >= 900
+              TMA_DEBUG_PRINT("TMA PRELOAD[%d] SEND: Calling cuda::memcpy_async (ARCH=%d)", preloadIdx, __CUDA_ARCH__);
               cuda::memcpy_async(
                 shmemDst,
                 reinterpret_cast<const unsigned char*>(globalSrc),
                 cuda::aligned_size_t<16>(loadBytes),
                 *tmaBar);
+              TMA_DEBUG_PRINT("TMA PRELOAD[%d] SEND: cuda::memcpy_async returned", preloadIdx);
+              #else
+              TMA_DEBUG_PRINT("TMA PRELOAD[%d] SEND: SKIPPED - ARCH=%d < 900", preloadIdx, __CUDA_ARCH__);
               #endif
             }
           }
@@ -359,13 +421,34 @@ class Primitives<
         int currentSliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
         int tmaSlot = slice % NCCL_TMA_PIPE_DEPTH;
         
+        // CONSUME: Even though we already loaded data in prologue/produce,
+        // we still need to call waitPeer to synchronize step across all threads
+        // (RoleWaitRecv, RolePostRecv, etc. need to have consistent step values)
+        if (tid == 0) {
+          T* userInput = (T*)ncclShmem.groups[group].userInput;
+          T* userOutput = (T*)ncclShmem.groups[group].userOutput;
+          if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
+          if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
+        }
+        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, currentSliceSize);
+        
+        TMA_DEBUG_PRINT("TMA MAIN LOOP[%d]: After waitPeer, step=%ld", slice, step);
+        
         // Wait for TMA load completion of current slice
         tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[tmaSlot]);
         tmaBar->wait(std::move(tmaTokens[tmaSlot]));
         
         TMA_DEBUG_PRINT("TMA WAIT DONE: slice=%d, tmaSlot=%d", slice, tmaSlot);
         
-        // Update src pointers to point to SMEM
+        // Debug: Check SMEM right after wait completes
+        if (tid == 0) {
+          void* tmaShmemSlot = ncclTmaShmemSlot(tmaSlot, NCCL_TMA_SLOT_SIZE);
+          T* smemData = (T*)tmaShmemSlot;
+          TMA_DEBUG_PRINT("  AFTER WAIT: smemData[0]=%f, smemData[1]=%f", 
+                          (float)smemData[0], (float)smemData[1]);
+        }
+        
+        // SECOND: Update src pointers to point to SMEM (where TMA loaded the data)
         if (tid == 0) {
           void* tmaShmemSlot = ncclTmaShmemSlot(tmaSlot, NCCL_TMA_SLOT_SIZE);
           if (Recv) {
@@ -425,16 +508,23 @@ class Primitives<
           int nextSliceSize = sliceSize < nelem-nextOffset ? sliceSize : nelem-nextOffset;
           int nextTmaSlot = nextSlice % NCCL_TMA_PIPE_DEPTH;
           
-          // Update pointers for next slice
-          if (tid == 0) {
+          // For Send operations, set source pointer to user buffer first
+          if (tid == 0 && Send && Src) {
             T* userInput = (T*)ncclShmem.groups[group].userInput;
             T* userOutput = (T*)ncclShmem.groups[group].userOutput;
-            if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + nextOffset;
-            if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + nextOffset;
+            ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + nextOffset;
           }
           
-          // Wait for peer to produce next data
-          waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, nextOffset, nextSliceSize);
+          // [TMA PRODUCE] Wait for peer for the next slice
+          // Pass nextSlice as sliceStep so it waits for the correct step
+          waitPeerForTmaLoad<DirectRecv, DirectSend, Recv, Send, Src, Dst>(
+            srcIx, dstIx, nextOffset, nextSliceSize, /*sliceStep=*/nextSlice);
+          
+          if (tid == 0) {
+            TMA_DEBUG_PRINT("TMA PRODUCE[%d]: step=%ld srcPtr=%p", 
+                            nextSlice, step, ncclShmem.groups[group].srcs[0]);
+          }
+          subBarrier();
           
           // Issue TMA for next slice
           if (tid == 0) {

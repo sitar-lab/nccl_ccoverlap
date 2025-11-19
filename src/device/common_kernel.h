@@ -297,6 +297,15 @@ __device__ __forceinline__ void reduceCopyFromSmem(
   ) {
   static_assert(std::is_signed<IntBytes>::value, "IntBytes must be a signed integral type.");
   
+  // Debug: Check SMEM source data
+  #if NCCL_TMA_DEBUG
+  if (thread == 0 && blockIdx.x == 0 && nSrcs > 0) {
+    T* smemPtr = (T*)srcPtrFn(0);
+    printf("[REDUCE_COPY_SMEM BLK=%d TID=%d] SMEM src[0]=%p, data[0]=%f, data[1]=%f, nElts=%d\n",
+           (int)blockIdx.x, (int)threadIdx.x, smemPtr, (float)smemPtr[0], (float)smemPtr[1], (int)nElts);
+  }
+  #endif
+  
   constexpr int BytePerPack = sizeof(T);
   constexpr int BytePerHunk = Unroll*WARP_SIZE*BytePerPack;
   
