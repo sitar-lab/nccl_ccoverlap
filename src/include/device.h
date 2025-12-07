@@ -21,6 +21,9 @@ extern const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS];
 extern const char* ncclProtoStr[NCCL_NUM_PROTOCOLS];
 
 #define NCCL_MAX_OPS 2048
+// [jihwan] NCCL_STEPS Configuration
+// NCCL_STEPS defines the number of slots in the circular buffer.
+// Default is 8. Increasing this allows for finer-grained pipelining but requires careful buffer management.
 #define NCCL_STEPS 8
 
 #ifdef __CUDA_ARCH__

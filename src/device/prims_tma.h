@@ -12,11 +12,20 @@
 #include <cuda/ptx>
 #include <new>
 
+// [jihwan] TMA Pipeline Implementation
+// This file implements the TMA (Tensor Memory Accelerator) protocol for NCCL.
+// All implementations are based on Simple protocol (prims_simple.h)
+// Key features:
+// 1. Pipelined Execution: Overlaps data transfer (TMA Load) with data transfer to peer GPU + computation (ReduceCopy).
+// 2. Prologue/MainLoop/Epilogue Structure: Prefetches data in prologue, consumes in main loop.
+// 3. Shared Memory Buffering: Loads data directly from global memory to SMEM using TMA.
+// 4. Step Synchronization: Uses waitPeerForTmaLoad to handle out-of-order slice completion.
+
 #ifndef NCCL_TMA_PIPE_DEPTH
   #define NCCL_TMA_PIPE_DEPTH 2
 #endif
 
-// TMA Debug output
+// [jihwan] TMA Debug output
 #define NCCL_TMA_DEBUG 0
 
 #if NCCL_TMA_DEBUG
@@ -79,6 +88,7 @@ class Primitives<
   uint64_t accSize;
 
   // Don't use barrier 0 as it's used by the final sync
+  // [jihwan] barrier for all threads
   __device__ void barrier() {
     if (nthreads == WARP_SIZE) __syncwarp();
     else {
@@ -86,6 +96,8 @@ class Primitives<
       barrier_sync(bar, nthreads);
     }
   }
+
+  // [jihwan] barrier only for worker threads
   __device__ void subBarrier() {
     if (nworkers == WARP_SIZE) __syncwarp();
     else {
@@ -176,7 +188,7 @@ class Primitives<
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
   __device__ __forceinline__ void waitPeer(intptr_t srcIx, intptr_t dstIx, int offset, int nelts) {
     
-    /* [ccoverlap]
+    /* [jihwan]
       Send:
         send = 1, recv = 0 : isSendNotRecv = 1
       Recv:
@@ -202,7 +214,7 @@ class Primitives<
         connFifo[step%NCCL_STEPS].size = nelts*sizeof(T);
 
 
-      /* [ccoverlap]
+      /* [jihwan]
         ptrs : array of pointers to srcs or dsts, store address of data to be sent or received in this slice
         if send func, we have to fill dest ptrs -> ptrs = dsts pointer
         if recv func, we have to fill source ptrs -> ptrs = srcs pointer
@@ -287,7 +299,7 @@ class Primitives<
     TMA_DEBUG_PRINT("GENERICOP INIT: Src=%d, Dst=%d, SrcBuf=%d, DstBuf=%d", Src, Dst, SrcBuf, DstBuf);
     TMA_DEBUG_PRINT("GENERICOP INIT: nelem = %d, Slice Size=%d, SlicePerChunk=%d",nelem, sliceSize, SlicePerChunk);
 
-    /* [ccoverlap] TMA Pipelined Implementation */
+    /* [jihwan] TMA Pipelined Implementation */
     using tma_barrier_t = cuda::barrier<cuda::thread_scope_block>;
     
     // Barrier storage using aligned_storage to avoid dynamic initialization in __device__ function

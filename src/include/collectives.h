@@ -18,6 +18,8 @@
 #define ALLREDUCE_CHUNKSTEPS (NCCL_STEPS/2)
 #define ALLGATHER_SLICESTEPS (NCCL_STEPS/4)
 #define ALLGATHER_CHUNKSTEPS (NCCL_STEPS/2)
+#define ALLGATHER_TMA_SLICESTEPS (NCCL_STEPS/8) // [jihwan] For TMA AllGather 
+#define ALLGATHER_TMA_CHUNKSTEPS (NCCL_STEPS/2) // [jihwan] For TMA AllGather
 #define ALLTOALL_SLICESTEPS 1
 #define ALLTOALL_CHUNKSTEPS 1
 #define REDUCESCATTER_SLICESTEPS (NCCL_STEPS/4)
@@ -30,7 +32,7 @@
 #define SCATTER_CHUNKSTEPS 1
 #define REDUCE_SLICESTEPS 1
 #define REDUCE_CHUNKSTEPS 1
-#define NCCL_MAX_SLICE_PER_CHUNK 2  // max value for CHUNKSTEPS/SLICESTEPS, must accord with above
+#define NCCL_MAX_SLICE_PER_CHUNK 4  // max value for CHUNKSTEPS/SLICESTEPS, must accord with above
 #define NCCL_MAX_NET_SIZE (1024*1024*1024L) // Rather than send INT_MAX which is 2G-1, send a power of two.
 
 const char* ncclFuncToString(ncclFunc_t op);

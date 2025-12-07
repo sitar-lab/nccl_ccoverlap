@@ -8,6 +8,7 @@
 #include "collectives.h"
 #include "primitives.h"
 
+// [jihwan] Do All gather at chunk-level with ring protocol
 namespace {
   template<typename T, typename RedOp, typename Proto, bool isNetOffload = false>
   __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
@@ -96,6 +97,7 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
   }
 };
 
+// [jihwan] calling TMA version of AllGather
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_TMA> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
@@ -103,7 +105,7 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_TMA> 
     if (isNetOffload)
       runRing<T, RedOp, ProtoTMA<1, 1>, true>(tid, nthreads, work);
     else
-      runRing<T, RedOp, ProtoTMA<ALLGATHER_CHUNKSTEPS/ALLGATHER_SLICESTEPS, ALLGATHER_SLICESTEPS>, false>(tid, nthreads, work);
+      runRing<T, RedOp, ProtoTMA<ALLGATHER_TMA_CHUNKSTEPS/ALLGATHER_TMA_SLICESTEPS, ALLGATHER_TMA_SLICESTEPS>, false>(tid, nthreads, work);
   }
 };
 

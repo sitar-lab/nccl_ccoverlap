@@ -62,6 +62,12 @@ struct ncclShmemData {
   alignas(16) char workStorage[1024];
 
 
+  // [jihwan] TMA Pipeline Support
+  // Added TMA-specific shared memory structures:
+  // 1. NCCL_TMA_PIPE_DEPTH: Pipeline depth for prefetching (default 2)
+  // 2. NCCL_TMA_SLOT_SIZE: Size of each SMEM slot for TMA loads
+  // 3. tmaSlots: Array of pointers to SMEM slots
+  // 4. tmaPipeSync: Synchronization primitives for pipeline management
   #ifndef NCCL_TMA_PIPE_DEPTH
     #define NCCL_TMA_PIPE_DEPTH 2
   #endif
@@ -88,7 +94,7 @@ struct ncclShmemData {
 extern __shared__ ncclShmemData ncclShmem;
 #if __CUDA_ARCH__ >= 700
   extern __shared__ ulong2 ncclShmemPerWarp[/*ncclShmemDynamicSize()/sizeof(ulong2)*/];
-  extern __shared__ __align__(16) uint8_t ncclShmemTmaBuffer[/*ncclShmemTmaBufferSize()*/];
+  extern __shared__ __align__(16) uint8_t ncclShmemTmaBuffer[/*ncclShmemTmaBufferSize()*/]; // [jihwan] for TMA loads
 #else
   extern __shared__ ulong2 ncclShmemPerWarp[ncclShmemScratchWarpSize()*(NCCL_MAX_NTHREADS/WARP_SIZE)/sizeof(ulong2)];
   extern __shared__ __align__(16) uint8_t ncclShmemTmaBuffer[64*1024]; // 64KB for TMA loads
