@@ -195,6 +195,12 @@ class Primitives<
     int slice = 0;
     int offset = 0;
 
+    if (tid == 0 && offset == 0) {
+      printf("Rank %d Group %d: Direct=%d DirectRecv=%d DirectSend=%d flags=0x%x (DirectWrite=%d, DirectRead=%d)\n", 
+        ncclShmem.comm.rank, group, Direct, DirectRecv, DirectSend, flags, 
+        (flags & DirectWrite) ? 1 : 0, (flags & DirectRead) ? 1 : 0);
+    }
+
     if (tid < nworkers && offset < nelem && !isNetOffload) {
       // Worker-only loop for non-empty slices. Non-workers and empty slices are
       // processed in the loop following this if block. The benefit of splitting

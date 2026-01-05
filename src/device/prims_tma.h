@@ -77,9 +77,9 @@ class Primitives<
   int flags;
   int group;
   uint64_t step;
-  struct ncclConnInfo* conn = NULL;
+  struct ncclConnInfo* conn = NULL; // pointer to connection info
   struct ncclConnFifo* connFifo = NULL;
-  T* connEltsFifo;
+  T* connEltsFifo; // Address of peer FIFO buffer
   T* directBuff = NULL;
   uint64_t *connStepPtr;
   uint64_t connStepCache; // Cache last seen value of (*connStepPtr)
@@ -148,12 +148,16 @@ class Primitives<
   // Separate function for TMA prologue/produce: wait for specific slice's data
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
   __device__ __forceinline__ void waitPeerForTmaLoad(intptr_t srcIx, intptr_t dstIx, int offset, int nelts, int sliceStep) {
+    uint64_t absStep = step + sliceStep;
+    
+    // Determine index in ptrs array
     const int index = Src ? 0 : (Dst ? (Send && Recv ? MaxSend : 0) : 0);
+
 
     // For Recv: Wait until peer has produced data for the specified slice step
     if (flags & (Recv * RoleWaitRecv)) {
       int spins = 0;
-      while (connStepCache < sliceStep + StepPerSlice) {
+      while (connStepCache < absStep + StepPerSlice) { // connStepCache is last seen step value(head, how much data have I received)
         connStepCache = loadStepValue(connStepPtr);
         if (checkAbort(flags, Aborted, spins)) break;
       }
@@ -161,23 +165,23 @@ class Primitives<
       // Set up source pointers to peer's FIFO buffer at the specified step
       void **ptrs = ncclShmem.groups[group].srcs + Src;
       
-      if ((flags & ConnFifoEnabled) && connFifo[sliceStep%NCCL_STEPS].mode == NCCL_MODE_OFFSET) {
-        ptrs[index] = connEltsFifo + loadInt(&connFifo[sliceStep%NCCL_STEPS].offset)/sizeof(T);
-      } else if (DirectRecv && !Direct) {
+      if ((flags & ConnFifoEnabled) && connFifo[absStep%NCCL_STEPS].mode == NCCL_MODE_OFFSET) {
+        ptrs[index] = connEltsFifo + loadInt(&connFifo[absStep%NCCL_STEPS].offset)/sizeof(T);
+      } else if (DirectRecv) {
         if (flags & DirectRead) {
           ptrs[index] = directBuff + srcIx + offset;
         } else {
-          ptrs[index] = connEltsFifo + (sliceStep%NCCL_STEPS)*connStepSize;
+          ptrs[index] = connEltsFifo + (absStep%NCCL_STEPS)*connStepSize;
         }
       } else {
-        ptrs[index] = connEltsFifo + (sliceStep%NCCL_STEPS)*connStepSize;
+        ptrs[index] = connEltsFifo + (absStep%NCCL_STEPS)*connStepSize;
       }
     }
     
     // For Send: Wait until peer's FIFO has space (for when we send to peer)
     if (flags & (Send * RoleWaitSend)) {
       int spins = 0;
-      while (connStepCache + NCCL_STEPS < sliceStep + StepPerSlice) {
+      while (connStepCache + NCCL_STEPS < absStep + StepPerSlice) {
         connStepCache = loadStepValue(connStepPtr);
         if (checkAbort(flags, Aborted, spins)) break;
       }
@@ -185,6 +189,9 @@ class Primitives<
     }
   }
   
+  // [jihwan]
+  // Wait for peer to be ready for next slice (in GMEM view)
+  // After executing this function, step is increased by StepPerSlice (only for wait roles threads)
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
   __device__ __forceinline__ void waitPeer(intptr_t srcIx, intptr_t dstIx, int offset, int nelts) {
     
@@ -200,6 +207,8 @@ class Primitives<
     const bool isSendNotRecv = (Send && Recv) ? (flags & RoleWaitSend) : Send;
 
     // Wait until peer has produced/consumed data
+    // If waiting to recv, wait until peer has produced data for this slice (check head pointer)
+    // If waiting to send, wait until peer has consumed data (check tail pointer)
     if ((flags & (Recv * RoleWaitRecv)) || (flags & (Send * RoleWaitSend))) {
       int spins = 0;
       while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
@@ -209,6 +218,7 @@ class Primitives<
       }
     }
 
+    // Guaranteed to use FIFO, set up ptrs now
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
       if ((flags & ConnFifoEnabled) && (flags & (Send * RoleWaitSend)))
         connFifo[step%NCCL_STEPS].size = nelts*sizeof(T);
@@ -218,9 +228,22 @@ class Primitives<
         ptrs : array of pointers to srcs or dsts, store address of data to be sent or received in this slice
         if send func, we have to fill dest ptrs -> ptrs = dsts pointer
         if recv func, we have to fill source ptrs -> ptrs = srcs pointer
+
+        Why we add Dst and Src to ptrs?
+        - The first space for dsts and srcs is reserved for User buffer when it exists
+
+        P2p : Activated when ncclSend or ncclRecv only
       */
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
                                   : (ncclShmem.groups[group].srcs + Src);
+
+      /* [jihwan]
+        Determine the actual pointer to use for this slice
+        NetRegMode: Using registered memory for network transfer
+      */
+     TMA_DEBUG_PRINT("[waitPeer Func] NetRegMode: %d",flags & NetRegMode);
+     TMA_DEBUG_PRINT("[waitPeer Func] ConnFifoEnabled: %d",flags & ConnFifoEnabled);
+
       if ((flags & NetRegMode) && ((!isSendNotRecv && DirectRecv) || (isSendNotRecv && DirectSend))) {
         if (P2p) {
           ptrs[index] = NULL;
@@ -256,6 +279,7 @@ class Primitives<
       else {
         // Yes, for some template arguments this code will be unreachable.  That's fine.
         // coverity[dead_error_line]
+        TMA_DEBUG_PRINT("[waitPeer Func] Reach that we intended");
         ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
       }
       if (flags & NetDeviceUnpack) {
@@ -265,6 +289,10 @@ class Primitives<
     }
   }
 
+
+  // [jihwan]
+  // Wait for peer to complete data store for the slice
+  // After executing this function, step is increased by StepPerSlice (only for post roles threads)
   template<int Recv, int Send>
   inline __device__ void postPeer(bool dataStored) {
     if (flags & (Recv*RolePostRecv | Send*RolePostSend)) {
@@ -300,21 +328,25 @@ class Primitives<
     TMA_DEBUG_PRINT("GENERICOP INIT: nelem = %d, Slice Size=%d, SlicePerChunk=%d",nelem, sliceSize, SlicePerChunk);
 
     /* [jihwan] TMA Pipelined Implementation */
+    // Sync with threads within the same block
     using tma_barrier_t = cuda::barrier<cuda::thread_scope_block>;
     
+    // [jihwan]
     // Barrier storage using aligned_storage to avoid dynamic initialization in __device__ function
+    // In this code, compiler allocate memory space for NCCL_TMA_PIPE_DEPTH barriers in __shared__ memory (Each thread don't execute constructor)
     __shared__ alignas(alignof(tma_barrier_t)) 
       std::aligned_storage_t<sizeof(tma_barrier_t), alignof(tma_barrier_t)> 
       barrierStorage[NCCL_TMA_PIPE_DEPTH];
     
-    // Token은 thread-local register에 저장 (각 thread가 자신의 token 배열 보유)
+    // [jihwan]
+    // Each thread has its own token array for TMA barriers
     typename tma_barrier_t::arrival_token tmaTokens[NCCL_TMA_PIPE_DEPTH];
     
     // Determine if TMA should be used
     bool shouldUseTma = false;
     if (Recv && !(flags & DirectWrite)) {
       shouldUseTma = true;  // Recv: load received data to SMEM
-    } else if (Send && Src) {
+    } else if (Send && Src) { // Don't use TMA for Send with no Src buffer, which corresponds to recvsend. In recvsend, in receive phase we already use TMA to load data to SMEM
       shouldUseTma = true;  // Send: load source data to SMEM before sending
     }
 
@@ -330,7 +362,7 @@ class Primitives<
           new (&barrierStorage[i]) tma_barrier_t(nworkers);
         }
         #if __CUDA_ARCH__ >= 900
-        cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+        cuda::ptx::fence_proxy_async(cuda::ptx::space_shared); // Ensure TMA barrier initialization is visible to async proxy(TMA path)
         #endif
         TMA_DEBUG_PRINT("TMA INIT: Initialized %d barriers, nworkers=%d", NCCL_TMA_PIPE_DEPTH, nworkers);
       }
@@ -346,7 +378,7 @@ class Primitives<
       
       
       for (int preloadIdx = 0; preloadIdx < preloadCount; ++preloadIdx) {
-        int currentSliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
+        int currentSliceSize = sliceSize < nelem-offset ? sliceSize : nelem - offset;
         int tmaSlot = preloadIdx % NCCL_TMA_PIPE_DEPTH;
         
         // For Send operations, set source pointer to user buffer first
