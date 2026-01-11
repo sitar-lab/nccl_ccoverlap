@@ -51,26 +51,25 @@ namespace {
         rankDest = ringRanks[0];
         offset = dataOffset + rankDest * count;
 
-        // Force FIFO usage for TMA - use send instead of directSend
         if ((inputBuf + dataOffset == outputBuf + offset) || isNetOffload) { // In place or onePPN
           prims.directSend(dataOffset, offset, nelem);
         } else {
-          prims.copySend(dataOffset, offset, nelem);
+          prims.directCopySend(dataOffset, offset, nelem);
         }
 
         // k-2 steps: copy to next GPU - use recvCopySend instead of directRecvCopyDirectSend
         for (int j = 1; j < nranks - 1; ++j) {
           rankDest = ringRanks[nranks - j];
           offset = dataOffset + rankDest * count;
-          prims.recvCopySend(offset, offset, nelem);
+          prims.directRecvCopyDirectSend(offset, offset, nelem);
         }
 
         // Make final copy from buffer to dest.
         rankDest = ringRanks[1];
         offset = dataOffset + rankDest * count;
 
-        // Final wait/copy - use recv instead of directRecv
-        prims.recv(offset, nelem);
+        // Final wait/copy.
+        prims.directRecv(offset, nelem);
       }
     } else if (inputBuf != outputBuf + ringRanks[0] * count) {
       inputBuf = inputBuf + partOffset;

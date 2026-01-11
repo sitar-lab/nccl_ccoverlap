@@ -284,46 +284,30 @@ __device__ __forceinline__ void reduceCopy(
      nDsts, [=]__device__(int i) { return dstPtrs[i]; }, nElts);
 }
 
-// SMEM-specific reduceCopy for TMA protocol
-// This version handles source pointers that are in shared memory
-template<int Unroll, typename RedFn, typename T,
+template<typename RedFn, typename T, int Unroll, int BytePerPack,
          int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
          typename IntBytes, typename SrcPtrFn, typename DstPtrFn>
-__device__ __forceinline__ void reduceCopyFromSmem(
-    int thread, int nThreads,
+__device__ __forceinline__ void reduceCopyFromSmemPacks(
+    int nThreads, int &thread,
     uint64_t redArg, uint64_t *preOpArgs, bool postOp,
     int nSrcs, SrcPtrFn const &srcPtrFn, int nDsts, DstPtrFn const &dstPtrFn,
-    IntBytes nElts
+    IntBytes &nBytesBehind, IntBytes &nBytesAhead
   ) {
-  static_assert(std::is_signed<IntBytes>::value, "IntBytes must be a signed integral type.");
-  
-  // Debug: Check SMEM source data
-  #if NCCL_TMA_DEBUG
-  if (thread == 0 && blockIdx.x == 0 && nSrcs > 0) {
-    T* smemPtr = (T*)srcPtrFn(0);
-    printf("[REDUCE_COPY_SMEM BLK=%d TID=%d] SMEM src[0]=%p, data[0]=%f, data[1]=%f, nElts=%d\n",
-           (int)blockIdx.x, (int)threadIdx.x, smemPtr, (float)smemPtr[0], (float)smemPtr[1], (int)nElts);
-  }
-  #endif
-  
-  constexpr int BytePerPack = sizeof(T);
   constexpr int BytePerHunk = Unroll*WARP_SIZE*BytePerPack;
-  
   int nWarps = nThreads/WARP_SIZE;
   int warp = thread/WARP_SIZE;
   int lane = thread%WARP_SIZE;
 
-  IntBytes nBytesBehind = 0;
-  IntBytes nBytesAhead = nElts*sizeof(T);
-  
-  // Thread's initial position
+  // This thread's initial position.
   IntBytes threadBytesBehind = nBytesBehind + (warp*BytePerHunk + lane*BytePerPack);
   IntBytes threadBytesAhead = nBytesAhead - (warp*BytePerHunk + lane*BytePerPack);
+  // Number of hunks to be consumed over all warps.
   IntBytes nHunksAhead = nBytesAhead/(BytePerHunk + !BytePerHunk);
-  
+  // Advance collective position.
   nBytesBehind += nHunksAhead*BytePerHunk;
   nBytesAhead -= nHunksAhead*BytePerHunk;
   if (Unroll==1 && BytePerPack <= nBytesAhead) {
+    // Only Unroll=1 can do partial hunks (where not all threads partake).
     nHunksAhead += 1;
     nBytesBehind += nBytesAhead - (nBytesAhead%(BytePerPack + !BytePerPack));
     nBytesAhead = nBytesAhead%(BytePerPack + !BytePerPack);
@@ -331,12 +315,14 @@ __device__ __forceinline__ void reduceCopyFromSmem(
   nHunksAhead -= warp;
 
   RedFn redFn(redArg);
-  uintptr_t smemSrcs[MinDsts + !MinDsts]; // Use MinDsts as MaxSrcs for SMEM
+  // Use a safe upper bound for sources logic since we don't have MaxSrcs template param.
+  // 16 is sufficient for NCCL_MAX_ARITY.
+  uintptr_t smemSrcs[16]; 
   uintptr_t minDsts[MinDsts + !MinDsts];
   
   #pragma unroll
-  for (int s=0; s < nSrcs && s < (MinDsts + !MinDsts); s++) {
-    // SMEM pointers don't need cvta_to_global, use direct address
+  for (int s=0; s < nSrcs && s < 16; s++) {
+    // SMEM pointers don't need cvta_to_global
     smemSrcs[s] = reinterpret_cast<uintptr_t>(srcPtrFn(s)) + threadBytesBehind;
   }
 
@@ -352,7 +338,7 @@ __device__ __forceinline__ void reduceCopyFromSmem(
     { RedFn preFn(0 < PreOpSrcs ? preOpArgs[0] : 0);
       #pragma unroll Unroll
       for (int u=0; u < Unroll; u++) {
-        // Direct load from shared memory - no volatile needed
+        // Direct load from shared memory
         acc[u] = *reinterpret_cast<BytePack<BytePerPack>*>(smemSrcs[0]);
         if (0 < PreOpSrcs) acc[u] = applyPreOp(preFn, acc[u]);
         smemSrcs[0] += WARP_SIZE*BytePerPack;
@@ -360,7 +346,7 @@ __device__ __forceinline__ void reduceCopyFromSmem(
     }
 
     // Handle additional SMEM sources if any
-    for (int s=1; s < nSrcs; s++) {
+    for (int s=1; s < nSrcs && s < 16; s++) {
       BytePack<BytePerPack> tmp[Unroll];
       RedFn preFn(s < PreOpSrcs ? preOpArgs[s] : 0);
       #pragma unroll Unroll
@@ -395,18 +381,9 @@ __device__ __forceinline__ void reduceCopyFromSmem(
       }
     }
     
-    for (int d=MinDsts; (MinDsts < MaxDsts) && (d < MaxDsts) && (d < nDsts); d++) {
-      uintptr_t dst = cvta_to_global(dstPtrFn(d)) + threadBytesBehind;
-      #pragma unroll Unroll
-      for (int u=0; u < Unroll; u++) {
-        st_global<BytePerPack>(dst, acc[u]);
-        dst += WARP_SIZE*BytePerPack;
-      }
-    }
-
-    nWarps = nThreads/WARP_SIZE;
+    // Advance pointers for next hunk
     #pragma unroll
-    for (int s=0; s < nSrcs && s < (MinDsts + !MinDsts); s++) {
+    for (int s=0; s < nSrcs && s < 16; s++) {
       smemSrcs[s] += (nWarps-1)*BytePerHunk;
     }
     #pragma unroll
@@ -417,6 +394,88 @@ __device__ __forceinline__ void reduceCopyFromSmem(
     threadBytesAhead -= nWarps*BytePerHunk;
     nHunksAhead -= nWarps;
   }
+
+  // Update thread state for caller
+  if (Unroll==1 && nHunksAhead > 0) nHunksAhead -= nWarps;
+  warp = -nHunksAhead;
+  thread = warp*WARP_SIZE + lane;
+}
+
+// SMEM-specific reduceCopy for TMA protocol
+// This version handles source pointers that are in shared memory
+template<int Unroll, typename RedFn, typename T,
+         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
+         typename IntBytes, typename SrcPtrFn, typename DstPtrFn>
+__device__ __forceinline__ void reduceCopyFromSmem(
+    int thread, int nThreads,
+    uint64_t redArg, uint64_t *preOpArgs, bool postOp,
+    int nSrcs, SrcPtrFn const &srcPtrFn, int nDsts, DstPtrFn const &dstPtrFn,
+    IntBytes nElts
+  ) {
+  static_assert(std::is_signed<IntBytes>::value, "IntBytes must be a signed integral type.");
+  
+  // Debug: Check SMEM source data
+  #if NCCL_TMA_DEBUG
+  if (thread == 0 && blockIdx.x == 0 && nSrcs > 0) {
+    T* smemPtr = (T*)srcPtrFn(0);
+    printf("[REDUCE_COPY_SMEM BLK=%d TID=%d] SMEM src[0]=%p, data[0]=%f, data[1]=%f, nElts=%d\n",
+           (int)blockIdx.x, (int)threadIdx.x, smemPtr, (float)smemPtr[0], (float)smemPtr[1], (int)nElts);
+  }
+  #endif
+
+  auto lane = thread % WARP_SIZE;
+  IntBytes nBytesBehind = 0;
+  IntBytes nBytesAhead = nElts*sizeof(T);
+
+  // Attempt to use Big Packs (16 bytes) if applicable
+  constexpr int BigPackSize = 16;
+  bool aligned = true;
+  
+  if (BigPackSize > sizeof(T)) {
+    // Check destination alignment
+    if (lane < nDsts) aligned &= (0 == cvta_to_global(dstPtrFn(lane)) % BigPackSize);
+    // [Safety] Check source (SMEM) alignment as well.
+    // Although TMA usually aligns buffers, misaligned offsets could cause issues with vectorized loads.
+    if (lane < nSrcs) aligned &= (0 == reinterpret_cast<uintptr_t>(srcPtrFn(lane)) % BigPackSize);
+    
+    aligned = __all_sync(~0u, aligned);
+    
+    if (aligned) {
+      reduceCopyFromSmemPacks<RedFn, T, Unroll, BigPackSize,
+        MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+        (nThreads, thread, redArg, preOpArgs, postOp,
+         nSrcs, srcPtrFn, nDsts, dstPtrFn, nBytesBehind, nBytesAhead);
+      
+      if (nBytesAhead == 0) return;
+
+      // Handle remaining bytes with Unroll=1 but still Big Packs
+      reduceCopyFromSmemPacks<RedFn, T, 1, BigPackSize,
+        MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+        (nThreads, thread, redArg, preOpArgs, postOp,
+         nSrcs, srcPtrFn, nDsts, dstPtrFn, nBytesBehind, nBytesAhead);
+         
+      if (nBytesAhead == 0) return;
+    }
+  }
+
+  // Fallback to sizeof(T) packs
+  // [Fix] Use standard Unroll factor instead of scaling it up.
+  // Aggressive unrolling (e.g., Unroll * 4 for fp16) causes compilation OOM (signal 9).
+  // Since TMA pointers are almost always aligned, this fallback path is rare and doesn't need aggressive optimization.
+  constexpr int RealUnroll = Unroll;
+  
+  reduceCopyFromSmemPacks<RedFn, T, RealUnroll, sizeof(T),
+      MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+      (nThreads, thread, redArg, preOpArgs, postOp,
+       nSrcs, srcPtrFn, nDsts, dstPtrFn, nBytesBehind, nBytesAhead);
+       
+  if (nBytesAhead == 0) return;
+
+  // Fallback tail
+  reduceCopyFromSmemPacks<RedFn, T, 1, sizeof(T),
+      MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+      (nThreads, thread, redArg, preOpArgs, postOp,
+       nSrcs, srcPtrFn, nDsts, dstPtrFn, nBytesBehind, nBytesAhead);
 }
 
 #endif // COMMON_KERNEL_H_

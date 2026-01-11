@@ -491,6 +491,21 @@ static ncclResult_t p2pSendConnect(struct ncclComm* comm, struct ncclConnect* co
   resources->recvMemSameProc = P2P_SAME_PID((comm->peerInfo + rank), (comm->peerInfo + info->rank));
 
   char* buff = (char*)(remDevMem+1);
+
+  // // [jihwan|DEBUG] Check pointer location
+  // cudaPointerAttributes attrs; 
+  // if (cudaPointerGetAttributes(&attrs, (void*)buff) == cudaSuccess) {
+  //   int currentDev;
+  //   cudaGetDevice(&currentDev);
+  //   const char* ptrType = "UNKNOWN";
+  //   if (attrs.type == cudaMemoryTypeDevice) ptrType = "Device";
+  //   else if (attrs.type == cudaMemoryTypeHost) ptrType = "Host";
+    
+  //   INFO(NCCL_INIT|NCCL_P2P, "[DEBUG] p2pSendConnect: Pointer %p is type %s. MyDev: %d, PtrDev: %d. Location: %s", 
+  //        buff, ptrType, currentDev, attrs.device, 
+  //        (attrs.device == currentDev) ? "LOCAL MEMORY" : "PEER GPU MEMORY");
+  // }
+
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
     if (info->read && p == NCCL_PROTO_SIMPLE) {
       /* For P2P Read the SIMPLE buffer is local (ncclSendMem) */

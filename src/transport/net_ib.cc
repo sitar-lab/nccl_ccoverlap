@@ -867,7 +867,8 @@ ncclResult_t ncclIbDmaBufSupport(int dev) {
   return ncclSystemError;
 }
 
-#define NCCL_NET_IB_MAX_RECVS 8
+#define NCCL_NET_IB_MAX_RECVS 8 // default
+// #define NCCL_NET_IB_MAX_RECVS 4
 
 ncclResult_t ncclIbGetPhysProperties(int dev, ncclNetProperties_t* props) {
   struct ncclIbDev* ibDev = ncclIbDevs + dev;

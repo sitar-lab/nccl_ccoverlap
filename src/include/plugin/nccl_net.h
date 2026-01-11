@@ -26,7 +26,8 @@
 #define NCCL_PTR_DMABUF 0x4
 
 // Maximum number of requests per comm object
-#define NCCL_NET_MAX_REQUESTS 32
+// #define NCCL_NET_MAX_REQUESTS 64 //
+#define NCCL_NET_MAX_REQUESTS 32 // default
 
 // Max number of ncclNet objects which can live in the same process
 #ifndef NCCL_NET_MAX_PLUGINS

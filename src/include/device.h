@@ -24,7 +24,7 @@ extern const char* ncclProtoStr[NCCL_NUM_PROTOCOLS];
 // [jihwan] NCCL_STEPS Configuration
 // NCCL_STEPS defines the number of slots in the circular buffer.
 // Default is 8. Increasing this allows for finer-grained pipelining but requires careful buffer management.
-#define NCCL_STEPS 8
+#define NCCL_STEPS 32
 
 #ifdef __CUDA_ARCH__
   #define NCCL_CUDA_ARCH __CUDA_ARCH__
@@ -99,7 +99,8 @@ union ncclLLFifoLine {
 #define NCCL_LL_FLAG_MAX   0x100
 #define NCCL_LL_FLAG(a) ((uint32_t)((a) % NCCL_LL_FLAG_MAX))
 #else
-#define NCCL_LL_CLEAN_MASK 0x7ffffff8
+// #define NCCL_LL_CLEAN_MASK 0x7ffffff8 // a multiple of 8 (default)
+#define NCCL_LL_CLEAN_MASK 0x7fffffc0 // a multiple of 64 (for bigger nccl_steps)
 #define NCCL_LL_FLAG(a) ((uint32_t)(a))
 #endif
 // Make sure the clean mask will last for at least NCCL_NSTEPS

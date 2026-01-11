@@ -21,9 +21,6 @@
 // 3. Shared Memory Buffering: Loads data directly from global memory to SMEM using TMA.
 // 4. Step Synchronization: Uses waitPeerForTmaLoad to handle out-of-order slice completion.
 
-#ifndef NCCL_TMA_PIPE_DEPTH
-  #define NCCL_TMA_PIPE_DEPTH 2
-#endif
 
 // [jihwan] TMA Debug output
 #define NCCL_TMA_DEBUG 0
@@ -147,46 +144,60 @@ class Primitives<
   
   // Separate function for TMA prologue/produce: wait for specific slice's data
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
-  __device__ __forceinline__ void waitPeerForTmaLoad(intptr_t srcIx, intptr_t dstIx, int offset, int nelts, int sliceStep) {
-    uint64_t absStep = step + sliceStep;
+  __device__ __forceinline__ void waitPeerForTmaLoad(intptr_t srcIx, intptr_t dstIx, int offset, int nelts, int sliceOffset) {
     
-    // Determine index in ptrs array
-    const int index = Src ? 0 : (Dst ? (Send && Recv ? MaxSend : 0) : 0);
+    // For Send:
+    // This function is for "TMA Load" preparation (checking if source data is ready).
+    // 1. If Src is UserInput (CopySend): Data is always assumed ready.
+    // 2. If Src is FIFO (RecvSend): Data availability is checked in the Recv block above.
+    // 3. Pointer setup for Src is done by the caller (tid=0 context in genericOp).
+    // 4. Checking peer's tail (space availability) should be done in Main Loop, not here.
+    // Therefore, Send role does NOTHING here to avoid pipeline stalls.
 
+    // Early Exit for Non-Recv Roles
+    if (!(flags & (Recv * RoleWaitRecv))) {
+        return;
+    }
 
+    // [Fix] Calculate stride per slice dynamically based on roles (Wait+Post)
+    int stepIncrement = 0;
+    if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) stepIncrement += StepPerSlice;
+    // if (flags & (Recv*RolePostRecv | Send*RolePostSend)) stepIncrement += StepPerSlice;
+
+    // [Fix] sliceOffset is 0-based index (0,1,2..) for the current chunk.
+    // Calculate absolute step correctly using StepPerSlice.
+    uint64_t absStep = step + sliceOffset * stepIncrement;
+    int buffSlot = absStep % NCCL_STEPS;
+    
+    #ifdef NCCL_TMA_DEBUG
+    // if (threadIdx.x == 0 && sliceOffset < 4) {
+    //      printf("TMA_DBG: R%d S%d A%llu I%d C%llu\n", ncclShmem.comm.rank, sliceOffset, absStep, stepIncrement, connStepCache);
+    // }
+    #endif
+    
     // For Recv: Wait until peer has produced data for the specified slice step
-    if (flags & (Recv * RoleWaitRecv)) {
-      int spins = 0;
-      while (connStepCache < absStep + StepPerSlice) { // connStepCache is last seen step value(head, how much data have I received)
-        connStepCache = loadStepValue(connStepPtr);
-        if (checkAbort(flags, Aborted, spins)) break;
-      }
-
-      // Set up source pointers to peer's FIFO buffer at the specified step
-      void **ptrs = ncclShmem.groups[group].srcs + Src;
-      
-      if ((flags & ConnFifoEnabled) && connFifo[absStep%NCCL_STEPS].mode == NCCL_MODE_OFFSET) {
-        ptrs[index] = connEltsFifo + loadInt(&connFifo[absStep%NCCL_STEPS].offset)/sizeof(T);
-      } else if (DirectRecv) {
-        if (flags & DirectRead) {
-          ptrs[index] = directBuff + srcIx + offset;
-        } else {
-          ptrs[index] = connEltsFifo + (absStep%NCCL_STEPS)*connStepSize;
-        }
-      } else {
-        ptrs[index] = connEltsFifo + (absStep%NCCL_STEPS)*connStepSize;
-      }
+    int spins = 0;
+    while (connStepCache < absStep + StepPerSlice) { 
+      connStepCache = loadStepValue(connStepPtr); // head
+      if (checkAbort(flags, Aborted, spins)) break;
     }
     
-    // For Send: Wait until peer's FIFO has space (for when we send to peer)
-    if (flags & (Send * RoleWaitSend)) {
-      int spins = 0;
-      while (connStepCache + NCCL_STEPS < absStep + StepPerSlice) {
-        connStepCache = loadStepValue(connStepPtr);
-        if (checkAbort(flags, Aborted, spins)) break;
+    // Set up source pointers to peer's FIFO buffer at the specified step
+    void **ptrs = ncclShmem.groups[group].srcs + Src;
+    const int index = 0;
+
+    if ((flags & ConnFifoEnabled) && connFifo[buffSlot].mode == NCCL_MODE_OFFSET) {
+      ptrs[index] = connEltsFifo + loadInt(&connFifo[buffSlot].offset)/sizeof(T);
+    } else if (DirectRecv) {
+      if (flags & DirectRead) {
+        ptrs[index] = directBuff + srcIx + offset;
+      } else {
+        ptrs[index] = connEltsFifo + buffSlot*connStepSize;
       }
-      // Note: Src pointers for Send should be set by caller (to user buffer)
+    } else {
+      ptrs[index] = connEltsFifo + buffSlot*connStepSize;
     }
+
   }
   
   // [jihwan]
@@ -205,16 +216,32 @@ class Primitives<
         in recvsend case according to their tid some threads will wait for send and some for recv
     */
     const bool isSendNotRecv = (Send && Recv) ? (flags & RoleWaitSend) : Send;
+    
+    // [jihwan] Check if we are in TMA mode (Send Only) or Simple mode (Recv/RecvSend)
+    // Send && !Recv && Src is the condition used in genericOp to enable TMA
+    const bool isTmaMode = (Send && !Recv && Src);
 
     // Wait until peer has produced/consumed data
     // If waiting to recv, wait until peer has produced data for this slice (check head pointer)
     // If waiting to send, wait until peer has consumed data (check tail pointer)
-    if ((flags & (Recv * RoleWaitRecv)) || (flags & (Send * RoleWaitSend))) {
+    
+    // [Optimization]
+    // 1. Send Role: Must check Peer's Tail (Space Availability)
+    // 2. Recv Role: Skip Head Check ONLY IF TMA IS USED. 
+    //    If !isTmaMode, we must perform head check like standard Simple protocol.
+    
+    if (flags & (Send * RoleWaitSend)) {
       int spins = 0;
-      while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
+      while (connStepCache + NCCL_STEPS < step + StepPerSlice) {
         connStepCache = loadStepValue(connStepPtr);
         if (checkAbort(flags, Aborted, spins)) break;
-        //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem.comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
+      }
+    } else if (flags & (Recv * RoleWaitRecv) && !isTmaMode) {
+      // [jihwan] Restore Head Check for non-TMA path (Recv/RecvSend)
+      int spins = 0;
+      while (connStepCache < step + StepPerSlice) {
+        connStepCache = loadStepValue(connStepPtr);
+        if (checkAbort(flags, Aborted, spins)) break;
       }
     }
 
@@ -234,57 +261,62 @@ class Primitives<
 
         P2p : Activated when ncclSend or ncclRecv only
       */
-      void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
-                                  : (ncclShmem.groups[group].srcs + Src);
 
-      /* [jihwan]
-        Determine the actual pointer to use for this slice
-        NetRegMode: Using registered memory for network transfer
-      */
-     TMA_DEBUG_PRINT("[waitPeer Func] NetRegMode: %d",flags & NetRegMode);
-     TMA_DEBUG_PRINT("[waitPeer Func] ConnFifoEnabled: %d",flags & ConnFifoEnabled);
+      // [Optimization] Recv Role skips pointer setup here ONLY IF TMA IS USED.
+      // If !isTmaMode, we must setup pointers.
+      bool skipPtrSetup = !isSendNotRecv && isTmaMode;
+      
+      if (!skipPtrSetup) {
+        void **ptrs = isSendNotRecv ? ncclShmem.groups[group].dsts + Dst
+                                    : ncclShmem.groups[group].srcs + Src;
+        
+        /* [jihwan]
+          Determine the actual pointer to use for this slice
+          NetRegMode: Using registered memory for network transfer
+        */
+        TMA_DEBUG_PRINT("[waitPeer Func] NetRegMode: %d",flags & NetRegMode);
+        TMA_DEBUG_PRINT("[waitPeer Func] ConnFifoEnabled: %d",flags & ConnFifoEnabled);
 
-      if ((flags & NetRegMode) && ((!isSendNotRecv && DirectRecv) || (isSendNotRecv && DirectSend))) {
-        if (P2p) {
-          ptrs[index] = NULL;
-        } else {
-          if (isSendNotRecv) {
-            if (!Recv)
-              ptrs[index] = NULL;
-            else
-              ptrs[index] = (T*)ncclShmem.groups[group].userOutput + dstIx + offset;
+        if ((flags & NetRegMode) && DirectSend) {
+          if (P2p) {
+            ptrs[index] = NULL;
           } else {
-            ptrs[index] = (T*)ncclShmem.groups[group].userOutput + srcIx + offset;
+             if (!Recv)
+               ptrs[index] = NULL;
+             else
+               ptrs[index] = (T*)ncclShmem.groups[group].userOutput + dstIx + offset;
           }
+        } else if ((flags & ConnFifoEnabled) && connFifo[step%NCCL_STEPS].mode == NCCL_MODE_OFFSET) {
+          ptrs[index] = connEltsFifo + loadInt(&connFifo[step%NCCL_STEPS].offset)/sizeof(T);
+        } else if (DirectSend && isSendNotRecv) { // DirectSend logic applies to Send role
+          if (flags & DirectWrite) {
+            ptrs[index] = directBuff + dstIx + offset;
+          } else if (flags & DirectRead) {  // empty send
+            ptrs[index] = nullptr;
+          } else {
+            ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
+          }
+        } else if (DirectRecv && !isSendNotRecv) { // DirectRecv logic applies to Recv role
+           if (flags & DirectRead) {
+             ptrs[index] = directBuff + srcIx + offset;
+           } else {
+             ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
+           }
         }
-      } else if ((flags & ConnFifoEnabled) && connFifo[step%NCCL_STEPS].mode == NCCL_MODE_OFFSET) {
-        ptrs[index] = connEltsFifo + loadInt(&connFifo[step%NCCL_STEPS].offset)/sizeof(T);
-      } else if (isSendNotRecv && DirectSend) {
-        if (flags & DirectWrite) {
-          ptrs[index] = directBuff + dstIx + offset;
-        } else if (flags & DirectRead) {  // empty send
-          ptrs[index] = nullptr;
-        } else {
+        else {
+          // Yes, for some template arguments this code will be unreachable.  That's fine.
+          // coverity[dead_error_line]
+          TMA_DEBUG_PRINT("[waitPeer Func] Reach that we intended");
           ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
         }
-      } else if (!isSendNotRecv && DirectRecv) {
-        if (flags & DirectRead) {
-          ptrs[index] = directBuff + srcIx + offset;
-        } else if (flags & DirectWrite) {
-          ptrs[index] = directBuff + dstIx + offset;  // send to next from my output buffer
-        } else {
-          ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
-        }
-      }
-      else {
-        // Yes, for some template arguments this code will be unreachable.  That's fine.
-        // coverity[dead_error_line]
-        TMA_DEBUG_PRINT("[waitPeer Func] Reach that we intended");
-        ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
-      }
+      } // End of Pointer Setup Logic
+
       if (flags & NetDeviceUnpack) {
         ncclNetDeviceIncrementHead(group, index);
       }
+      #ifdef NCCL_TMA_DEBUG
+      // if (threadIdx.x == 0 && step < 20) printf("WaitPeer: Step %llu -> %llu\n", step, step + StepPerSlice);
+      #endif
       step += StepPerSlice;
     }
   }
@@ -344,10 +376,10 @@ class Primitives<
     
     // Determine if TMA should be used
     bool shouldUseTma = false;
-    if (Recv && !(flags & DirectWrite)) {
-      shouldUseTma = true;  // Recv: load received data to SMEM
-    } else if (Send && Src) { // Don't use TMA for Send with no Src buffer, which corresponds to recvsend. In recvsend, in receive phase we already use TMA to load data to SMEM
-      shouldUseTma = true;  // Send: load source data to SMEM before sending
+    // [jihwan] Use TMA only for pure Send operations.
+    // Recv and RecvSend fallback to simple path (no TMA) to avoid waiting for peer data which causes stalls.
+    if (Send && !Recv && Src) {
+      shouldUseTma = true;
     }
 
     if (tid < nworkers && totalSlices > 0 && !isNetOffload && shouldUseTma) {
@@ -398,12 +430,14 @@ class Primitives<
                           preloadIdx, step, ncclShmem.groups[group].srcs[0], connStepCache);
         }
         
+        tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[tmaSlot]);
+
         // Issue TMA load (thread 0 only)
         if (tid == 0) {
           void* tmaShmemSlot = ncclTmaShmemSlot(tmaSlot, NCCL_TMA_SLOT_SIZE);
-          tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[tmaSlot]);
+          // tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[tmaSlot]);
           
-          if (Recv) {
+          if (Recv) { // Recv and RecvSend
             for (int i = 0; i < fan.nrecv(); i++) {
               if (ncclShmem.groups[group].srcs[i] != nullptr) {
                 void* globalSrc = ncclShmem.groups[group].srcs[i];
@@ -426,7 +460,7 @@ class Primitives<
                 #endif
               }
             }
-          } else if (Send && Src) {
+          } else if (Send && Src) { // Send only
             if (ncclShmem.groups[group].srcs[0] != nullptr) {
               void* globalSrc = ncclShmem.groups[group].srcs[0];
               void* shmemDst = (char*)tmaShmemSlot;
@@ -451,7 +485,7 @@ class Primitives<
         }
         
         // All threads arrive at barrier and save token
-        tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[tmaSlot]);
+        // tma_barrier_t* tmaBar = reinterpret_cast<tma_barrier_t*>(&barrierStorage[tmaSlot]);
         tmaTokens[tmaSlot] = tmaBar->arrive();
         
         offset += currentSliceSize;
@@ -492,6 +526,17 @@ class Primitives<
                           (float)smemData[0], (float)smemData[1]);
         }
         
+        // [Optimization] Move postPeer earlier to unblock Sender
+        // logic:
+        // 1. Recv Only: We have data in SMEM. We can release the GMEM buffer (Tail) immediately.
+        // 2. Send Only / RecvSend: We must WRITE data to GMEM (FIFO) before signaling (Head).
+        //    So we must wait until reduceCopyFromSmem completes.
+        bool earlyPost = Recv && !Send;
+        if (earlyPost) {
+           barrier(); // Ensure all threads see data arrival
+           postPeer<Recv, Send>(0 < currentSliceSize);
+        }
+
         // SECOND: Update src pointers to point to SMEM (where TMA loaded the data)
         if (tid == 0) {
           void* tmaShmemSlot = ncclTmaShmemSlot(tmaSlot, NCCL_TMA_SLOT_SIZE);
@@ -532,7 +577,7 @@ class Primitives<
           
           reduceCopyFromSmem<Unroll, RedOp, T,
             MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
-            (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
+            (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, false /*postOp*/,
               Recv * fan.nrecv() + Src, [&](int i) { return ncclShmem.groups[group].srcs[i]; },
               Send * fan.nsend() + Dst, [&](int i) { return ncclShmem.groups[group].dsts[i]; },
               workSize);
@@ -540,8 +585,10 @@ class Primitives<
           workSize = 0;
         }
         TMA_DEBUG_PRINT("BEFORE POST PEER (TMA): slice=%d", slice);
-        barrier(); // Sync before issuing next TMA
-        postPeer<Recv, Send>(0 < workSize);
+        if (!earlyPost) {
+           barrier(); // Ensure reduceCopyFromSmem completed writing to GMEM
+           postPeer<Recv, Send>(0 < workSize);
+        }
         TMA_DEBUG_PRINT("AFTER POST PEER (TMA): slice=%d", slice);
         // ========================================
         // PRODUCE: Issue TMA load for next slice (slice + NCCL_TMA_PIPE_DEPTH)
@@ -560,9 +607,21 @@ class Primitives<
           }
           
           // [TMA PRODUCE] Wait for peer for the next slice
-          // Pass nextSlice as sliceStep so it waits for the correct step
+          // Pass relative offset from current step
+          // Note: Since postPeer acts early, step has been incremented.
+          // WaitPeer (in loop start) + PostPeer (moved up) = Step + 2*StepPerSlice.
+          // Before change: PostPeer was at end. Step was +1*StepPerSlice when waitPeerForTmaLoad called? No.
+          // waitPeer() + postPeer() are both called inside loop.
+          // Before: waitPeer() -> reduce() -> postPeer() -> produce()
+          // Produce called when step was already incremented by both (if produce was after postPeer?)
+          // Wait, Produce is at end of loop.
+          // Original: waitPeer -> reduce -> barrier -> postPeer -> produce
+          // So step was incremented by TWO.
+          // Next Slice Relative Offset: nextSlice - (slice + 1).
+          // If step corresponds to Slice+1 (completed), then nextSlice is distant by (nextSlice - (Slice+1)).
+          // Code logic remains same.
           waitPeerForTmaLoad<DirectRecv, DirectSend, Recv, Send, Src, Dst>(
-            srcIx, dstIx, nextOffset, nextSliceSize, /*sliceStep=*/nextSlice);
+            srcIx, dstIx, nextOffset, nextSliceSize, /*sliceStep=*/nextSlice - (slice + 1));
           
           if (tid == 0) {
             TMA_DEBUG_PRINT("TMA PRODUCE[%d]: step=%ld srcPtr=%p", 
